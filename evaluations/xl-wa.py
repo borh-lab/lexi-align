@@ -6,13 +6,13 @@ from pathlib import Path
 import tempfile
 from typing import List, Optional, Tuple
 import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
+import seaborn as sns  # type: ignore
+import pandas as pd  # type: ignore
 from lexi_align.models import TextAlignment, TokenAlignment
 from lexi_align.utils import export_pharaoh_format, make_unique, read_pharaoh_file
 from lexi_align.text_processing import remove_unique_one
-from tqdm import tqdm
-import requests
+from tqdm import tqdm  # type: ignore
+import requests  # type: ignore
 from zipfile import ZipFile
 from io import BytesIO
 from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
@@ -202,8 +202,8 @@ def evaluate_results(
             )
 
             # Customize violin colors and style
-            color = plt.cm.Set3(i / num_models)
-            for pc in violin_parts["bodies"]:
+            color = plt.cm.get_cmap('Set3')(i / num_models)  # type: ignore
+            for pc in violin_parts["bodies"]:  # type: ignore[attr-defined]
                 pc.set_facecolor(color)
                 pc.set_alpha(0.7)
 
@@ -241,10 +241,11 @@ def evaluate_results(
     plt.subplots_adjust(bottom=0.2)  # Add space at bottom for legend
 
     # Collect all language pairs
-    lang_pairs = set()
-    for results in all_results.values():
-        lang_pairs.update(results["language_pairs"].keys())
-    lang_pairs = sorted(lang_pairs)
+    lang_pairs = sorted({
+        pair
+        for results in all_results.values()
+        for pair in results["language_pairs"].keys()
+    })
 
     # Build tables per model
     tables = []

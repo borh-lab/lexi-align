@@ -150,7 +150,7 @@ def export_pharaoh_format(
     target_positions = {token: i for i, token in enumerate(unique_target)}
 
     # Process alignments
-    alignment_pairs = set()
+    alignment_pairs: list[tuple[int, int]] = []
     for align in alignment.alignment:
         # Get base tokens and find their uniquified versions
         s_token = align.source_token
@@ -169,10 +169,10 @@ def export_pharaoh_format(
         else:
             t_pos = target_positions.get(t_token, target_positions[remove_unique_one(t_token)])
             
-        alignment_pairs.add((s_pos, t_pos))
+        alignment_pairs.append((s_pos, t_pos))
 
     # Sort alignment pairs
-    alignment_pairs = sorted(alignment_pairs)
+    alignment_pairs.sort()
     alignment_str = " ".join(f"{s}-{t}" for s, t in alignment_pairs)
 
     # Join tokens into sentences using uniquified versions
@@ -197,6 +197,8 @@ def parse_pharaoh_format(line: str) -> tuple[str, str, TextAlignment]:
             raise ValueError("Input must have exactly 3 tab-separated parts")
 
         source_sentence, target_sentence, alignments = parts
+        
+        # Split sentences into tokens
         source_tokens = source_sentence.split()
         target_tokens = target_sentence.split()
 
@@ -217,7 +219,14 @@ def parse_pharaoh_format(line: str) -> tuple[str, str, TextAlignment]:
                 )
             )
 
-        return source_sentence, target_sentence, TextAlignment(alignment=alignment_list)
+        # Create TextAlignment object
+        text_alignment = TextAlignment(alignment=alignment_list)
+
+        # Verify alignment by round-tripping through export_pharaoh_format
+        _ = export_pharaoh_format(source_tokens, target_tokens, text_alignment)
+
+        # Return the original sentences and alignment
+        return source_sentence, target_sentence, text_alignment
     except Exception as e:
         raise ValueError(f"Failed to parse Pharaoh format: {str(e)}") from e
 
@@ -288,7 +297,11 @@ def write_pharaoh_file(
     with open(filepath, "w", encoding="utf-8") as f:
         for source, target, alignment in alignments:
             try:
-                line = export_pharaoh_format(source, target, alignment)
+                # Convert source and target strings to token lists
+                source_tokens = source.split()
+                target_tokens = target.split()
+                
+                line = export_pharaoh_format(source_tokens, target_tokens, alignment)
                 f.write(line + "\n")
             except Exception as e:
                 logger.warning(f"Failed to write alignment: {e}")

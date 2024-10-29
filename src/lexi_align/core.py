@@ -7,10 +7,12 @@ from lexi_align.utils import (
 )
 from lexi_align.models import TextAlignment
 from lexi_align.adapters import LLMAdapter
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 from logging import getLogger
 
 logger = getLogger(__name__)
+
+Message = Union[SystemMessage, UserMessage, AssistantMessage]
 
 
 def align_tokens(
@@ -66,7 +68,7 @@ def align_tokens(
             TokenAlignment(source_token='mat', target_token='tapis')
         ])
     """
-    messages = []
+    messages: List[Message] = []
     messages.append(
         SystemMessage(
             (
