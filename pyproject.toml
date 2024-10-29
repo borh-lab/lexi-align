@@ -29,4 +29,5 @@ build-backend = "hatchling.build"
 [tool.uv]
 dev-dependencies = [
     "boto3>=1.35.50",
+    "mypy>=1.13.0",
 ]
