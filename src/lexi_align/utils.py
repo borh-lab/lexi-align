@@ -126,9 +126,9 @@ def make_unique(names: list[str]) -> list[str]:
 
 def export_pharaoh_format(
     source_tokens: list[str],
-    target_tokens: list[str], 
+    target_tokens: list[str],
     alignment: TextAlignment,
-    sep: str = "\t"
+    sep: str = "\t",
 ) -> str:
     """Export alignment data in Pharaoh format.
 
@@ -155,20 +155,24 @@ def export_pharaoh_format(
         # Get base tokens and find their uniquified versions
         s_token = align.source_token
         t_token = align.target_token
-        
+
         # If tokens aren't already uniquified, they'll be in the positions dict
         # If they are uniquified, they should match entries in the positions dict
         if s_token in source_positions:
             s_pos = source_positions[s_token]
         else:
             # Handle already uniquified tokens
-            s_pos = source_positions.get(s_token, source_positions[remove_unique_one(s_token)])
-            
+            s_pos = source_positions.get(
+                s_token, source_positions[remove_unique_one(s_token)]
+            )
+
         if t_token in target_positions:
             t_pos = target_positions[t_token]
         else:
-            t_pos = target_positions.get(t_token, target_positions[remove_unique_one(t_token)])
-            
+            t_pos = target_positions.get(
+                t_token, target_positions[remove_unique_one(t_token)]
+            )
+
         alignment_pairs.append((s_pos, t_pos))
 
     # Sort alignment pairs
@@ -197,7 +201,7 @@ def parse_pharaoh_format(line: str) -> tuple[str, str, TextAlignment]:
             raise ValueError("Input must have exactly 3 tab-separated parts")
 
         source_sentence, target_sentence, alignments = parts
-        
+
         # Split sentences into tokens
         source_tokens = source_sentence.split()
         target_tokens = target_sentence.split()
@@ -214,8 +218,7 @@ def parse_pharaoh_format(line: str) -> tuple[str, str, TextAlignment]:
                 raise ValueError(f"Alignment indices {s_idx}-{t_idx} out of bounds")
             alignment_list.append(
                 TokenAlignment(
-                    source_token=unique_source[s_idx],
-                    target_token=unique_target[t_idx]
+                    source_token=unique_source[s_idx], target_token=unique_target[t_idx]
                 )
             )
 
@@ -300,7 +303,7 @@ def write_pharaoh_file(
                 # Convert source and target strings to token lists
                 source_tokens = source.split()
                 target_tokens = target.split()
-                
+
                 line = export_pharaoh_format(source_tokens, target_tokens, alignment)
                 f.write(line + "\n")
             except Exception as e:
