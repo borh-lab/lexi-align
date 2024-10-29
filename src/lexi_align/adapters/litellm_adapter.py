@@ -55,7 +55,7 @@ def custom_callback(
     start_time,
     end_time,  # start/end time
 ):
-    logger.info(kwargs["litellm_params"]["metadata"])
+    logger.debug(kwargs["litellm_params"]["metadata"])
 
 
 def track_cost_callback(
@@ -68,19 +68,15 @@ def track_cost_callback(
         response_cost = kwargs[
             "response_cost"
         ]  # litellm calculates response cost for you
-        print("regular response_cost", response_cost)
+        logger.info(f"regular response_cost: {response_cost}")
     except Exception:
         pass
-
-
-from pprint import pprint
 
 
 def get_transformed_inputs(
     kwargs,
 ):
     params_to_model = kwargs["additional_args"]["complete_input_dict"]
-    pprint(params_to_model)
     logger.info(f"params to model: {params_to_model}")
 
 
