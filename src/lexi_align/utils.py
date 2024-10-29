@@ -141,28 +141,43 @@ def export_pharaoh_format(
     Returns:
         String in Pharaoh format: "source target alignments"
     """
+    # Create unique versions of tokens
+    unique_source = make_unique(source_tokens)
+    unique_target = make_unique(target_tokens)
+
     # Create mapping of tokens to their positions
-    source_positions = {token: i for i, token in enumerate(source_tokens)}
-    target_positions = {token: i for i, token in enumerate(target_tokens)}
+    source_positions = {token: i for i, token in enumerate(unique_source)}
+    target_positions = {token: i for i, token in enumerate(unique_target)}
 
     # Process alignments
     alignment_pairs = set()
     for align in alignment.alignment:
-        # Use the tokens exactly as they appear in the alignment
+        # Get base tokens and find their uniquified versions
         s_token = align.source_token
         t_token = align.target_token
-        # Find position of the token
-        s_pos = source_positions[s_token]
-        t_pos = target_positions[t_token]
+        
+        # If tokens aren't already uniquified, they'll be in the positions dict
+        # If they are uniquified, they should match entries in the positions dict
+        if s_token in source_positions:
+            s_pos = source_positions[s_token]
+        else:
+            # Handle already uniquified tokens
+            s_pos = source_positions.get(s_token, source_positions[remove_unique_one(s_token)])
+            
+        if t_token in target_positions:
+            t_pos = target_positions[t_token]
+        else:
+            t_pos = target_positions.get(t_token, target_positions[remove_unique_one(t_token)])
+            
         alignment_pairs.add((s_pos, t_pos))
 
     # Sort alignment pairs
     alignment_pairs = sorted(alignment_pairs)
     alignment_str = " ".join(f"{s}-{t}" for s, t in alignment_pairs)
 
-    # Join tokens into sentences
-    source_sentence = " ".join(source_tokens)
-    target_sentence = " ".join(target_tokens)
+    # Join tokens into sentences using uniquified versions
+    source_sentence = " ".join(unique_source)
+    target_sentence = " ".join(unique_target)
 
     return f"{source_sentence}{sep}{target_sentence}{sep}{alignment_str}"
 

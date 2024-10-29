@@ -42,9 +42,9 @@ llm_adapter = LiteLLMAdapter(model_params={
     "temperature": 0.0
 })
 
-# Provide pre-tokenized input
-source_tokens = ["The", "cat", "sat", "on", "the", "mat"]
-target_tokens = ["Le", "chat", "était", "assis", "sur", "le", "tapis"]
+# Provide pre-tokenized input with repeated tokens
+source_tokens = ["the", "big", "cat", "saw", "the", "cat"]  # Note: "the" and "cat" appear twice
+target_tokens = ["le", "gros", "chat", "a", "vu", "le", "chat"]
 
 alignment = align_tokens(
     llm_adapter,
@@ -54,37 +54,28 @@ alignment = align_tokens(
     target_language="French"
 )
 
-# Access the alignments
-for align in alignment.alignment:
-    print(f"{align.source_token} -> {align.target_token}")
-```
-
-### Example Output
-
-The above code will produce alignment output like this:
-
-```python
-The -> Le
-cat -> chat
-sat -> était
-sat -> assis
-on -> sur
-the -> le
-mat -> tapis
+# Example output will show the uniquified tokens:
+# the₁ -> le₁
+# big -> gros
+# cat₁ -> chat₁
+# saw -> a
+# saw -> vu
+# the₂ -> le₂
+# cat₂ -> chat₂
 ```
 
 ### Performance
 
 Here are some preliminary results on the test EN-SL subset of XL-WA:
 
-### gpt-4o-2024-08-06 (1shot) (seed=42)
+#### gpt-4o-2024-08-06 (1shot) (seed=42)
 
 | Language Pair | Precision | Recall | F1 |
 | --- | --- | --- | --- |
 | EN-SL | 0.863 | 0.829 | 0.846 |
 | **Average** | **0.863** | **0.829** | **0.846** |
 
-### claude-3-haiku-20240307 (1shot)
+#### claude-3-haiku-20240307 (1shot)
 
 | Language Pair | Precision | Recall | F1 |
 | --- | --- | --- | --- |
@@ -108,7 +99,7 @@ pharaoh_format = export_pharaoh_format(
 )
 
 print(pharaoh_format)
-# Output:
+# Output (will differ depending on chosen model):
 # The cat sat on the mat    Le chat était assis sur le tapis    0-0 1-1 2-2 2-3 3-4 4-5 5-6
 ```
 
@@ -166,7 +157,7 @@ If you use this software in your research, please cite:
   title = {lexi-align: Word Alignment via Structured Generation},
   author = {Hodošček, Bor},
   year = {2024},
-  url = {https://github.com/borh/lexi-align}
+  url = {https://github.com/borh-lab/lexi-align}
 }
 ```
 
@@ -193,7 +184,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 To set up the development environment:
 
 ```bash
-git clone https://github.com/borh/lexi-align.git
+git clone https://github.com/borh-lab/lexi-align.git
 cd lexi-align
 pip install -e ".[dev]"
 ```

@@ -92,6 +92,14 @@ def test_invalid_inputs():
         make_unique(["word", 123, "test"])
 
 
+def test_make_unique_idempotent():
+    """Test that make_unique is idempotent."""
+    tokens = ["the", "cat", "the", "mat"]
+    unique_tokens = make_unique(tokens)
+    # Running make_unique again should return the same result
+    assert make_unique(unique_tokens) == unique_tokens
+
+
 def test_whitespace_preservation():
     """Test that whitespace and special characters are preserved."""
     # Original test was wrong - these tokens are all different so they shouldn't get subscripts
