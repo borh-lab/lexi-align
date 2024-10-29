@@ -26,6 +26,8 @@ jobs:
       - name: pytest
         run: uv run pytest
       - name: lint
-        run: uv run ruff check src tests evaluations
+        run: |
+          uv pip install ruff
+          uv run ruff check --output-format=github src tests evaluations
       - name: format
         run: uv run ruff format --check src tests evaluations
