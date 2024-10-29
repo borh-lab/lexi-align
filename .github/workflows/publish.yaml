@@ -1,10 +1,8 @@
-name: Publish
+name: Publish Python package to PyPi when a release is created
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  release:
+    types: [created]
 
 jobs:
   pypi-publish:
@@ -16,7 +14,16 @@ jobs:
       # IMPORTANT: this permission is mandatory for trusted publishing
       id-token: write
     steps:
-      # retrieve your distributions here
-
+      - uses: actions/checkout@v4
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+      - name: Install Python 3.12
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync --extra dev -p 3.12
+      - name: Build
+        run: uv build --no-sources
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
