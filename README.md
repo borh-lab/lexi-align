@@ -1,6 +1,6 @@
 # lexi-align
 
-Word alignment between two languages using structured generation with Large Language Models.
+Word alignment of multilingual sentences using structured generation with Large Language Models.
 
 ## Installation
 
@@ -30,7 +30,7 @@ uv add lexi-align --extra litellm
 
 ### Basic Usage
 
-The library expects pre-tokenized input - it does not perform any tokenization. You must provide tokens as lists of strings:
+The library expects pre-tokenized input--it does not perform any tokenization. You must provide tokens as lists of strings:
 
 ```python
 from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
@@ -143,6 +143,10 @@ Available command-line arguments:
 - `--sample-size`: Number of test examples to evaluate per language pair
 - `--output`: Path to save results JSON file
 - `--verbose`: Enable verbose logging
+
+## Planned improvements
+
+- [ ] structured generation support (adapter additions) for local models via [Outlines](https://github.com/dottxt-ai/outlines) and [llama.cpp GBNF](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md)
 
 ## License
 
