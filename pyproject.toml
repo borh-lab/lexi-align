@@ -1,6 +1,6 @@
 [project]
 name = "lexi-align"
-version = "0.1.0"
+version = "0.2.0"
 description = "Word alignment between two languages using structured generation"
 readme = "README.md"
 authors = [
@@ -13,24 +13,57 @@ dependencies = [
 
 [project.optional-dependencies]
 litellm = ["litellm>=1.51.0"]
-dev = [
-    "pytest>=7.0.0",
-    "litellm>=1.51.0",
-    "requests>=2.31.0",
-    "matplotlib>=3.7.0",
-    "seaborn>=0.12.0",
-    "pandas>=2.0.0",
+outlines = [
+    "outlines>=0.1.1",
+    "transformers>=4.46.1",
+    "torch>=2.5.1",
+    "accelerate>=1.0.1",
+    # If using ROCm:
+    # "torch==2.5.1+rocm6.2",
+    # "pytorch-triton-rocm==3.1.0",
 ]
+llama-cpp = ["llama-cpp-python>=0.3.1"]
+
+# The following is for different accelerators:
+[tool.uv.sources]
+# torch = { index = "pytorch-cuda", marker = "sys_platform != 'darwin'" }
+# pytorch-triton-rocm = { index = "pytorch-rocm", marker = "sys_platform != 'darwin'" }
+# llama-cpp-python = { index = "llama-cpp-python-cuda" }
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.2"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "llama-cpp-python-cuda"
+url = "https://abetlen.github.io/llama-cpp-python/whl/cu125"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
+    "litellm>=1.51.0",
     "boto3>=1.35.50",
+    # Eval
+    "requests>=2.31.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "pandas>=2.0.0",
+    # Testing
+    "pytest>=7.0.0",
+    "pytest-mock>=3.12.0",
     "mypy>=1.13.0",
     "pandas-stubs",
     "types-tqdm",
     "types-requests",
+    "hf-transfer>=0.1.8",
 ]
