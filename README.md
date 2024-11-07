@@ -26,6 +26,30 @@ Using uv:
 uv add lexi-align --extra litellm
 ```
 
+For LLM support via Outlines (for local models), install with:
+
+```bash
+pip install lexi-align[outlines]
+```
+
+Using uv:
+
+```bash
+uv add lexi-align --extra outlines
+```
+
+For LLM support via llama.cpp (for local models), install with:
+
+```bash
+pip install lexi-align[llama]
+```
+
+Using uv:
+
+```bash
+uv add lexi-align --extra llama
+```
+
 ## Usage
 
 ### Basic Usage
@@ -64,6 +88,160 @@ alignment = align_tokens(
 # cat₂ -> chat₂
 ```
 
+### Using Custom Guidelines and Examples
+
+You can provide custom alignment guidelines and examples to improve alignment quality:
+
+```python
+from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
+from lexi_align.core import align_tokens
+from lexi_align.models import TextAlignment, TokenAlignment
+
+# Initialize adapter as before
+llm_adapter = LiteLLMAdapter(model_params={
+    "model": "gpt-4",
+    "temperature": 0.0
+})
+
+# Define custom guidelines
+guidelines = """
+1. Align content words (nouns, verbs, adjectives) first
+2. Function words should be aligned when they have clear correspondences
+3. Handle idiomatic expressions by aligning all components
+4. One source token can align to multiple target tokens and vice versa
+"""
+
+# Provide examples to demonstrate desired alignments
+examples = [
+    (
+        "The cat".split(),  # source tokens
+        "Le chat".split(),  # target tokens
+        TextAlignment(      # gold alignment
+            alignment=[
+                TokenAlignment(source_token="The", target_token="Le"),
+                TokenAlignment(source_token="cat", target_token="chat"),
+            ]
+        )
+    ),
+    # Add more examples as needed
+]
+
+# Use guidelines and examples in alignment
+alignment = align_tokens(
+    llm_adapter,
+    source_tokens,
+    target_tokens,
+    source_language="English",
+    target_language="French",
+    guidelines=guidelines,
+    examples=examples
+)
+```
+
+### Raw Message Control
+
+For more control over the prompt, you can use `align_tokens_raw` to provide custom messages:
+
+```python
+from lexi_align.core import align_tokens_raw
+
+custom_messages = [
+    {"role": "system", "content": "You are an expert translator aligning English to French."},
+    {"role": "user", "content": "Follow these guidelines:\n" + guidelines},
+    # Add any other custom messages
+]
+
+alignment = align_tokens_raw(
+    llm_adapter,
+    source_tokens,
+    target_tokens,
+    custom_messages
+)
+```
+
+### Token Uniquification
+
+The library automatically handles repeated tokens by adding unique markers:
+
+```python
+from lexi_align.utils import make_unique, remove_unique
+
+# Tokens with repeats
+tokens = ["the", "cat", "the", "mat"]
+
+# Add unique markers
+unique_tokens = make_unique(tokens)
+print(unique_tokens)  # ['the₁', 'cat', 'the₂', 'mat']
+
+# Remove markers
+original_tokens = remove_unique(unique_tokens)
+print(original_tokens)  # ['the', 'cat', 'the', 'mat']
+```
+
+You can also customize the marker style:
+
+```python
+from lexi_align.text_processing import create_underscore_generator
+
+# Use underscore markers instead of subscripts
+marker_gen = create_underscore_generator()
+unique_tokens = make_unique(tokens, marker_gen)
+print(unique_tokens)  # ['the_1', 'cat', 'the_2', 'mat']
+```
+
+### Using Local Models with Outlines
+
+For running local models, you can use the Outlines adapter:
+
+```python
+from lexi_align.adapters.outlines_adapter import OutlinesAdapter
+from lexi_align.core import align_tokens
+
+# Initialize the Outlines adapter with a local model
+llm_adapter = OutlinesAdapter(
+    model_name="Qwen/Qwen2.5-1.5B-Instruct",  # or any local model path
+    dtype="bfloat16",  # optional: choose quantization
+    device="cuda"      # optional: specify device
+)
+
+# Use the same API as with other adapters
+alignment = align_tokens(
+    llm_adapter,
+    source_tokens,
+    target_tokens,
+    source_language="English",
+    target_language="French"
+)
+```
+
+### Using Local Models with llama.cpp
+
+For running local models with llama.cpp:
+
+```python
+from lexi_align.adapters.llama_cpp_adapter import LlamaCppAdapter
+from lexi_align.core import align_tokens
+
+# Initialize the llama.cpp adapter with a local model
+llm_adapter = LlamaCppAdapter(
+    model_path="path/to/model.gguf",
+    n_gpu_layers=-1,  # Use GPU acceleration
+)
+
+# Note that for some GGUF models the pre-tokenizer might fail,
+# in which case you can specify the tokenizer_repo_id, which
+# should point to the base model's repo_id on Huggingface.
+
+# Use the same API as with other adapters
+alignment = align_tokens(
+    llm_adapter,
+    source_tokens,
+    target_tokens,
+    source_language="English",
+    target_language="French"
+)
+```
+
 ### Performance
 
 Here are some preliminary results on the test EN-SL subset of XL-WA:
@@ -82,7 +260,15 @@ Here are some preliminary results on the test EN-SL subset of XL-WA:
 | EN-SL | 0.651 | 0.630 | 0.640 |
 | **Average** | **0.651** | **0.630** | **0.640** |
 
-For reference, the 1-shot (1 example) `gpt-4o-2024-08-06` results are bettern than all systems presented in the [paper](https://ceur-ws.org/Vol-3596/paper32.pdf) (Table 2).
+#### meta-llama/Llama-3.2-3B-Instruct (1shot)
+
+| Language Pair | Precision | Recall | F1 |
+| --- | --- | --- | --- |
+| EN-SL | 0.606 | 0.581 | 0.593 |
+| **Average** | **0.606** | **0.581** | **0.593** |
+
+For reference, the 1-shot (1 example) `gpt-4o-2024-08-06` results for EN-SL outperform all systems presented in the [paper](https://ceur-ws.org/Vol-3596/paper32.pdf) (Table 2).
+Smaller LLMs perform below SOTA.
 
 ### Pharaoh Format Export
 
@@ -146,7 +332,8 @@ Available command-line arguments:
 
 ## Planned improvements
 
-- [ ] structured generation support (adapter additions) for local models via [Outlines](https://github.com/dottxt-ai/outlines) and [llama.cpp GBNF](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md)
+- [x] structured generation support (adapter additions) for local models via [Outlines](https://github.com/dottxt-ai/outlines) and [llama.cpp GBNF](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md)
+- [x] retries on errors or invalid alignments
 
 ## License
 
