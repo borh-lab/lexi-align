@@ -57,7 +57,7 @@ def test_align_tokens(source, target, source_lang, target_lang, expected, mock_r
     expected_alignment = eval(expected.strip())
 
     class TestMockLLMAdapter(LLMAdapter):
-        def __call__(self, messages):
+        def __call__(self, messages: list[dict]) -> TextAlignment:
             return mock_result
 
     adapter = TestMockLLMAdapter()
@@ -148,11 +148,16 @@ def test_align_tokens_raw(source, target, custom_messages, expected, mock_result
 
 
 def test_align_tokens_error_handling():
-    def error_llm_fn(messages):
-        raise ValueError("Test error")
+    """Test error handling in alignment functions."""
+
+    class ErrorAdapter(LLMAdapter):
+        def __call__(self, messages: list[dict]) -> TextAlignment:
+            raise ValueError("Test error")
+
+    error_adapter = ErrorAdapter()
 
     with pytest.raises(ValueError):
-        align_tokens(error_llm_fn, ["test"], ["test"])
+        align_tokens(error_adapter, ["test"], ["test"])
 
     with pytest.raises(ValueError):
-        align_tokens_raw(error_llm_fn, ["test"], ["test"], [])
+        align_tokens_raw(error_adapter, ["test"], ["test"], [])

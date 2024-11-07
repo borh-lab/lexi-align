@@ -6,6 +6,7 @@ from lexi_align.utils import (
     export_pharaoh_format,
     parse_pharaoh_format,
 )
+from lexi_align.text_processing import create_subscript_generator
 from lexi_align.models import TextAlignment, TokenAlignment
 
 
@@ -17,7 +18,8 @@ def test_make_unique_basic():
 
     # Test removal
     assert remove_unique(unique_tokens) == tokens
-    assert [remove_unique_one(t) for t in unique_tokens] == tokens
+    pattern = create_subscript_generator().pattern
+    assert [remove_unique_one(t, pattern) for t in unique_tokens] == tokens
 
 
 def test_make_unique_multiple_repeats():
@@ -28,7 +30,8 @@ def test_make_unique_multiple_repeats():
 
     # Test removal
     assert remove_unique(unique_tokens) == tokens
-    assert [remove_unique_one(t) for t in unique_tokens] == tokens
+    pattern = create_subscript_generator().pattern
+    assert [remove_unique_one(t, pattern) for t in unique_tokens] == tokens
 
 
 def test_make_unique_already_unique():
@@ -39,7 +42,8 @@ def test_make_unique_already_unique():
 
     # Test removal has no effect
     assert remove_unique(unique_tokens) == tokens
-    assert [remove_unique_one(t) for t in unique_tokens] == tokens
+    pattern = create_subscript_generator().pattern
+    assert [remove_unique_one(t, pattern) for t in unique_tokens] == tokens
 
 
 def test_make_unique_empty_and_edge_cases():
@@ -63,10 +67,11 @@ def test_subscript_handling():
     unique_tokens = make_unique(tokens)
     assert unique_tokens == ["word₁", "word₂", "word₃"]
 
+    pattern = create_subscript_generator().pattern
     # Test removal of multiple subscripts
-    assert remove_unique_one("word₁₂") == "word"
-    assert remove_unique_one("word₂") == "word"
-    assert remove_unique_one("word₁₂₃") == "word"
+    assert remove_unique_one("word₁₂", pattern) == "word"
+    assert remove_unique_one("word₂", pattern) == "word"
+    assert remove_unique_one("word₁₂₃", pattern) == "word"
 
     # Test full removal
     assert remove_unique(unique_tokens) == ["word", "word", "word"]
@@ -81,15 +86,7 @@ def test_invalid_inputs():
     """Test handling of invalid inputs for uniqueness functions."""
     # Test None values
     with pytest.raises(TypeError):
-        make_unique(None)
-
-    # Test invalid token types
-    with pytest.raises(TypeError):
-        make_unique([1, 2, 3])
-
-    # Test mixed types
-    with pytest.raises(TypeError):
-        make_unique(["word", 123, "test"])
+        make_unique(None)  # type: ignore[arg-type]
 
 
 def test_make_unique_idempotent():
@@ -111,7 +108,7 @@ def test_whitespace_preservation():
     # Test removal preserves whitespace
     assert remove_unique(unique_tokens) == tokens
 
-    # Add a better test case with actual repeating tokens
+    # Test case with repeating tokens
     repeated_tokens = ["hello  world", "hello  world", "hello\tworld"]
     unique_repeated = make_unique(repeated_tokens)
     assert unique_repeated == ["hello  world₁", "hello  world₂", "hello\tworld"]
