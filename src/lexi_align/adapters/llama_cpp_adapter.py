@@ -1,7 +1,6 @@
 import re
 from typing import Optional, Any, List, cast, Tuple
 from llama_cpp import Llama
-import outlines
 from lexi_align.adapters import LLMAdapter
 from lexi_align.models import TextAlignment
 from logging import getLogger

@@ -2,8 +2,7 @@ import pytest
 import os
 from lexi_align.core import align_tokens
 from lexi_align.adapters.llama_cpp_adapter import LlamaCppAdapter, _get_model_files
-from lexi_align.models import TextAlignment, TokenAlignment
-from lexi_align.text_processing import create_underscore_generator
+from lexi_align.models import TextAlignment
 
 
 def test_format_messages(mocker):

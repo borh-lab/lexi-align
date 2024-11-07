@@ -1,5 +1,4 @@
 from typing import Optional, Any, Dict, Literal, cast
-from outlines.generate import SequenceGenerator
 from outlines.samplers import Sampler
 import torch
 import outlines
