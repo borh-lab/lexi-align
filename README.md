@@ -1,5 +1,8 @@
 # lexi-align
 
+[![PyPI version](https://badge.fury.io/py/lexi-align.svg)](https://badge.fury.io/py/lexi-align)
+[![CI](https://github.com/borh-lab/lexi-align/actions/workflows/ci.yaml/badge.svg)](https://github.com/borh-lab/lexi-align/actions/workflows/ci.yaml)
+
 Word alignment of multilingual sentences using structured generation with Large Language Models.
 
 ## Installation
@@ -278,6 +281,7 @@ While the core alignment functions work with pre-tokenized input, the Pharaoh fo
 from lexi_align.utils import export_pharaoh_format
 
 # Note: Pharaoh format assumes space-separated tokens
+# Default separator is tab
 pharaoh_format = export_pharaoh_format(
     source_tokens,  # Pre-tokenized list of strings
     target_tokens,  # Pre-tokenized list of strings
@@ -287,6 +291,18 @@ pharaoh_format = export_pharaoh_format(
 print(pharaoh_format)
 # Output (will differ depending on chosen model):
 # The cat sat on the mat    Le chat était assis sur le tapis    0-0 1-1 2-2 2-3 3-4 4-5 5-6
+
+# Use custom separator
+pharaoh_format = export_pharaoh_format(
+    source_tokens,
+    target_tokens, 
+    alignment,
+    sep=" ||| "  # Custom separator
+)
+
+print(pharaoh_format)
+# Output:
+# The cat sat on the mat ||| Le chat était assis sur le tapis ||| 0-0 1-1 2-2 2-3 3-4 4-5 5-6
 ```
 
 The Pharaoh format consists of three tab-separated fields:

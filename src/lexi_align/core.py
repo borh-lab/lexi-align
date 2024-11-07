@@ -5,7 +5,7 @@ from lexi_align.utils import (
     format_messages,
     make_unique,
 )
-from lexi_align.models import TextAlignment
+from lexi_align.models import TextAlignment, TokenAlignment
 from lexi_align.adapters import LLMAdapter
 from typing import Optional, List, Tuple, Union
 from logging import getLogger
@@ -180,28 +180,34 @@ def align_tokens(
             logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
             if attempt == max_retries - 1:
                 # On last attempt, try to extract any valid alignments from previous responses
-                valid_alignments = []
+                valid_alignments: list[TokenAlignment] = []
                 for msg in messages:
-                    if isinstance(msg, AssistantMessage) and hasattr(msg.content, "alignment"):
-                        result = msg.content
-                        unique_source = set(make_unique(source_tokens))
-                        unique_target = set(make_unique(target_tokens))
-                        
-                        valid_alignments.extend([
-                            align 
-                            for align in result.alignment
-                            if align.source_token in unique_source 
-                            and align.target_token in unique_target
-                        ])
-                
+                    if isinstance(msg, AssistantMessage):
+                        # Get the content, which must be a TextAlignment
+                        if isinstance(msg.content, TextAlignment):
+                            result = msg.content
+                            unique_source = set(make_unique(source_tokens))
+                            unique_target = set(make_unique(target_tokens))
+
+                            valid_alignments.extend(
+                                [
+                                    align
+                                    for align in result.alignment
+                                    if align.source_token in unique_source
+                                    and align.target_token in unique_target
+                                ]
+                            )
+
                 if valid_alignments:
                     logger.warning(
                         f"Returning {len(valid_alignments)} valid alignments after {max_retries} failed attempts"
                     )
                     return TextAlignment(alignment=valid_alignments)
-                    
+
                 # If no valid alignments found, raise error
-                raise ValueError(f"Failed to get valid alignments after {max_retries} attempts") from e
+                raise ValueError(
+                    f"Failed to get valid alignments after {max_retries} attempts"
+                ) from e
 
     # If we get here and have no valid alignments, raise the error
     raise ValueError(
@@ -270,4 +276,9 @@ def align_tokens_raw(
             ),
         }
     )
-    return llm_adapter(messages)
+    # The llm_adapter.__call__ method should return a TextAlignment object
+    result = llm_adapter(messages)
+    # Ensure result is a TextAlignment before returning
+    if not isinstance(result, TextAlignment):
+        raise ValueError(f"LLM adapter returned {type(result)}, expected TextAlignment")
+    return result
