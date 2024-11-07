@@ -1,8 +1,12 @@
-from pydantic import BaseModel
-from typing import Union
+from typing import Union, Optional, Any
 import re
+from lexi_align.text_processing import (
+    MarkerGenerator,
+    create_subscript_generator,
+    remove_unique_one,
+)
 from lexi_align.models import TextAlignment, TokenAlignment
-from lexi_align.text_processing import remove_unique_one
+from pydantic import BaseModel
 from logging import getLogger
 
 logger = getLogger(__name__)
@@ -32,11 +36,14 @@ class AssistantMessage:
             self.content = content
 
 
-def format_messages(*messages):
+def format_messages(*messages) -> list[dict[str, str]]:
     # Handle both individual messages and lists of messages
+    message_list: list[Any]
     if len(messages) == 1 and isinstance(messages[0], list):
-        messages = messages[0]
-    return [{"role": msg.role, "content": msg.content} for msg in messages]
+        message_list = messages[0]
+    else:
+        message_list = list(messages)  # Convert tuple to list
+    return [{"role": msg.role, "content": msg.content} for msg in message_list]
 
 
 STRIP_RE = re.compile(r"[^\w\s']")
@@ -76,21 +83,29 @@ def remove_unique(tokens: list[str]) -> list[str]:
         >>> remove_unique(["cat₁", "the₂", "normal"])
         ['cat', 'the', 'normal']
     """
-    return [remove_unique_one(token) for token in tokens]
+    marker_generator = create_subscript_generator()  # Get default marker generator
+    return [remove_unique_one(token, marker_generator.pattern) for token in tokens]
 
 
-def make_unique(names: list[str]) -> list[str]:
-    """Add subscript numbers to disambiguate repeated tokens.
+def make_unique(
+    names: list[str], marker_generator: Optional[MarkerGenerator] = None
+) -> list[str]:
+    """Add unique markers to disambiguate repeated tokens.
 
     Args:
         names: List of tokens
+        marker_generator: Optional MarkerGenerator containing both the generation function
+                        and removal pattern. If None, uses subscript numbers (₁, ₂, etc.)
 
     Returns:
-        List of tokens with subscript numbers added to duplicates
+        List of tokens with unique markers added to duplicates
 
     Example:
         >>> make_unique(["the", "cat", "the", "mat"])
         ['the₁', 'cat', 'the₂', 'mat']
+        >>> from lexi_align.text_processing import create_underscore_generator
+        >>> make_unique(["the", "cat", "the", "mat"], create_underscore_generator())
+        ['the_1', 'cat', 'the_2', 'mat']
     """
     if not isinstance(names, list):
         raise TypeError("Input must be a list")
@@ -99,26 +114,25 @@ def make_unique(names: list[str]) -> list[str]:
         if not isinstance(name, str):
             raise TypeError("All tokens must be strings")
 
-    # Strip existing subscripts and count base tokens
-    base_tokens = [remove_unique_one(name) for name in names]
+    # Use default subscript generator if none provided
+    marker_generator = marker_generator or create_subscript_generator()
+
+    # Strip existing markers and count base tokens
+    base_tokens = [remove_unique_one(name, marker_generator.pattern) for name in names]
     base_counts: dict[str, int] = {}
     base_seen: dict[str, int] = {}
     unique_names = []
-    subscript_digits = "₀₁₂₃₄₅₆₇₈₉"
-
-    def to_subscript(num):
-        return "".join(subscript_digits[int(digit)] for digit in str(num))
 
     # First pass: count base token occurrences
     for base_token in base_tokens:
         base_counts[base_token] = base_counts.get(base_token, 0) + 1
 
-    # Second pass: add subscripts
+    # Second pass: add markers
     for i, base_token in enumerate(base_tokens):
         if base_counts[base_token] > 1:
             count = base_seen.get(base_token, 0) + 1
             base_seen[base_token] = count
-            unique_names.append(f"{base_token}{to_subscript(count)}")
+            unique_names.append(f"{base_token}{marker_generator.generate(count)}")
         else:
             unique_names.append(base_token)
     return unique_names
@@ -141,6 +155,9 @@ def export_pharaoh_format(
     Returns:
         String in Pharaoh format: "source target alignments"
     """
+    # Get default marker generator
+    marker_generator = create_subscript_generator()
+
     # Create unique versions of tokens
     unique_source = make_unique(source_tokens)
     unique_target = make_unique(target_tokens)
@@ -163,14 +180,16 @@ def export_pharaoh_format(
         else:
             # Handle already uniquified tokens
             s_pos = source_positions.get(
-                s_token, source_positions[remove_unique_one(s_token)]
+                s_token,
+                source_positions[remove_unique_one(s_token, marker_generator.pattern)],
             )
 
         if t_token in target_positions:
             t_pos = target_positions[t_token]
         else:
             t_pos = target_positions.get(
-                t_token, target_positions[remove_unique_one(t_token)]
+                t_token,
+                target_positions[remove_unique_one(t_token, marker_generator.pattern)],
             )
 
         alignment_pairs.append((s_pos, t_pos))
@@ -206,7 +225,7 @@ def parse_pharaoh_format(line: str) -> tuple[str, str, TextAlignment]:
         source_tokens = source_sentence.split()
         target_tokens = target_sentence.split()
 
-        # Create unique versions of tokens
+        # Create unique versions of tokens directly
         unique_source = make_unique(source_tokens)
         unique_target = make_unique(target_tokens)
 
