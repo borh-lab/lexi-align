@@ -532,6 +532,12 @@ def main():
         help="JSON string of kwargs for transformers.AutoModelForCausalLM.from_pretrained()",
     )
     analyze_parser.add_argument(
+        "--model-dtype",
+        choices=["float32", "float16", "bfloat16", "int8", "int4"],
+        default="bfloat16",
+        help="Data type for model weights (outlines only)",
+    )
+    analyze_parser.add_argument(
         "--beam-size",
         type=int,
         help="Number of beams for beam search (outlines only, overrides other sampling parameters)",
@@ -634,6 +640,7 @@ def main():
                 beam_size=args.beam_size,
                 # Model configuration
                 device=args.model_device,
+                dtype=args.model_dtype,
                 model_kwargs=args.model_kwargs,
                 **(args.transformers_kwargs or {}),
             )
