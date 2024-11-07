@@ -4,7 +4,7 @@ import argparse
 import random
 from pathlib import Path
 import tempfile
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 import matplotlib.pyplot as plt
 import seaborn as sns  # type: ignore
 import pandas as pd  # type: ignore
@@ -18,12 +18,19 @@ from tqdm import tqdm  # type: ignore
 import requests  # type: ignore
 from zipfile import ZipFile
 from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
+from lexi_align.adapters.outlines_adapter import OutlinesAdapter
+from lexi_align.adapters.llama_cpp_adapter import LlamaCppAdapter
 from lexi_align.core import align_tokens
 from lexi_align.utils import parse_pharaoh_format
 from lexi_align.metrics import calculate_metrics
 import logging
 
 logger = logging.getLogger(__name__)
+
+ADAPTER_TYPES = {
+    "litellm": LiteLLMAdapter,
+    "outlines": OutlinesAdapter,
+}
 
 LANGUAGE_MAP = {
     "BG": "Bulgarian",
@@ -347,7 +354,7 @@ def load_training_examples(
 def evaluate_language_pair(
     repo_path: Path,
     lang_pair: str,
-    llm_adapter: LiteLLMAdapter,
+    llm_adapter: Union[LiteLLMAdapter, OutlinesAdapter, LlamaCppAdapter],
     args: argparse.Namespace,
 ) -> tuple[dict, list[dict], list[str]]:
     """Evaluate alignment performance for a single language pair using micro-averaging."""
@@ -498,6 +505,48 @@ def main():
     )
     analyze_parser.add_argument("--model", default="gpt-4", help="LLM model to use")
     analyze_parser.add_argument(
+        "--adapter",
+        choices=list(ADAPTER_TYPES.keys()),
+        default="litellm",
+        help="Adapter type to use (litellm or outlines)",
+    )
+    analyze_parser.add_argument(
+        "--samples",
+        type=int,
+        default=1,
+        help="Number of samples for multinomial sampling (outlines only)",
+    )
+    analyze_parser.add_argument(
+        "--model-device",
+        choices=["cuda", "cpu"],
+        help="Device to run model on (default: auto-detect)",
+    )
+    analyze_parser.add_argument(
+        "--model-kwargs",
+        type=json.loads,
+        help="JSON string of kwargs for model initialization",
+    )
+    analyze_parser.add_argument(
+        "--transformers-kwargs",
+        type=json.loads,
+        help="JSON string of kwargs for transformers.AutoModelForCausalLM.from_pretrained()",
+    )
+    analyze_parser.add_argument(
+        "--beam-size",
+        type=int,
+        help="Number of beams for beam search (outlines only, overrides other sampling parameters)",
+    )
+    analyze_parser.add_argument(
+        "--top-k",
+        type=int,
+        help="Top-k filtering parameter (outlines only)",
+    )
+    analyze_parser.add_argument(
+        "--top-p",
+        type=float,
+        help="Top-p filtering parameter (outlines only)",
+    )
+    analyze_parser.add_argument(
         "--num-train-examples",
         type=int,
         help="Number of training examples to use for few-shot learning",
@@ -553,15 +602,41 @@ def main():
         # Setup random seed for example selection only
         random.seed(args.seed)
 
-        # Create LLM adapter with temperature and optional seed
-        model_params = {
-            "model": args.model,
-            "temperature": args.temperature,
-        }
-        if args.model_seed is not None:
-            model_params["seed"] = args.model_seed
-
-        llm_adapter = LiteLLMAdapter(model_params=model_params)
+        # Create LLM adapter based on type
+        if args.adapter == "litellm":
+            model_params = {
+                "model": args.model,
+                "temperature": args.temperature,
+            }
+            if args.model_seed is not None:
+                model_params["seed"] = args.model_seed
+            llm_adapter: Union[LiteLLMAdapter, OutlinesAdapter, LlamaCppAdapter] = (
+                LiteLLMAdapter(model_params=model_params)
+            )
+        elif args.adapter == "llama-cpp":
+            llm_adapter = LlamaCppAdapter(
+                model_path=args.model,
+                temperature=args.temperature,
+                n_gpu_layers=args.n_gpu_layers,
+                n_ctx=args.n_ctx,
+                n_batch=args.n_batch,
+                n_threads=args.n_threads,
+                **(args.model_kwargs or {}),
+            )
+        else:  # outlines
+            llm_adapter = OutlinesAdapter(
+                model_name=args.model,
+                # Sampling parameters
+                temperature=args.temperature,
+                samples=args.samples,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                beam_size=args.beam_size,
+                # Model configuration
+                device=args.model_device,
+                model_kwargs=args.model_kwargs,
+                **(args.transformers_kwargs or {}),
+            )
 
         lang_pairs = get_language_pairs(args.lang_pairs)
 
