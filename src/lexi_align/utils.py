@@ -153,7 +153,7 @@ def export_pharaoh_format(
         sep: Separator character for Pharaoh format fields (default: tab)
 
     Returns:
-        String in Pharaoh format: "source target alignments"
+        String in Pharaoh format: "source target alignments" with custom separator
     """
     # Get default marker generator
     marker_generator = create_subscript_generator()
@@ -205,19 +205,20 @@ def export_pharaoh_format(
     return f"{source_sentence}{sep}{target_sentence}{sep}{alignment_str}"
 
 
-def parse_pharaoh_format(line: str) -> tuple[str, str, TextAlignment]:
+def parse_pharaoh_format(line: str, sep: str = "\t") -> tuple[str, str, TextAlignment]:
     """Parse a line in Pharaoh format.
 
     Args:
-        line: Tab-separated line in Pharaoh format
+        line: Separator-delimited line in Pharaoh format
+        sep: Separator character (default: tab)
 
     Returns:
         Tuple of (source_sentence, target_sentence, TextAlignment)
     """
     try:
-        parts = line.strip().split("\t")
+        parts = line.strip().split(sep)
         if len(parts) != 3:
-            raise ValueError("Input must have exactly 3 tab-separated parts")
+            raise ValueError(f"Input must have exactly 3 {sep}-separated parts")
 
         source_sentence, target_sentence, alignments = parts
 
@@ -253,11 +254,14 @@ def parse_pharaoh_format(line: str) -> tuple[str, str, TextAlignment]:
         raise ValueError(f"Failed to parse Pharaoh format: {str(e)}") from e
 
 
-def read_pharaoh_file(filepath: str) -> list[tuple[str, str, TextAlignment]]:
+def read_pharaoh_file(
+    filepath: str, sep: str = "\t"
+) -> list[tuple[str, str, TextAlignment]]:
     """Read alignments from a file in Pharaoh format.
 
     Args:
         filepath: Path to input file
+        sep: Separator character (default: tab)
 
     Returns:
         List of (source_sentence, target_sentence, TextAlignment) tuples
@@ -281,20 +285,21 @@ def read_pharaoh_file(filepath: str) -> list[tuple[str, str, TextAlignment]]:
     with open(filepath, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
             try:
-                alignments.append(parse_pharaoh_format(line))
+                alignments.append(parse_pharaoh_format(line, sep=sep))
             except ValueError as e:
                 logger.warning(f"Skipping line {line_num} due to error: {e}")
     return alignments
 
 
 def write_pharaoh_file(
-    filepath: str, alignments: list[tuple[str, str, TextAlignment]]
+    filepath: str, alignments: list[tuple[str, str, TextAlignment]], sep: str = "\t"
 ) -> None:
     """Write alignments to a file in Pharaoh format.
 
     Args:
         filepath: Path to output file
         alignments: List of alignment tuples
+        sep: Separator character (default: tab)
 
     Example:
         >>> # Create test data
@@ -323,7 +328,9 @@ def write_pharaoh_file(
                 source_tokens = source.split()
                 target_tokens = target.split()
 
-                line = export_pharaoh_format(source_tokens, target_tokens, alignment)
+                line = export_pharaoh_format(
+                    source_tokens, target_tokens, alignment, sep=sep
+                )
                 f.write(line + "\n")
             except Exception as e:
                 logger.warning(f"Failed to write alignment: {e}")
