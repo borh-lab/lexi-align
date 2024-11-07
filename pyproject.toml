@@ -1,6 +1,6 @@
 [project]
 name = "lexi-align"
-version = "0.2.0"
+version = "0.2.1"
 description = "Word alignment between two languages using structured generation"
 readme = "README.md"
 authors = [

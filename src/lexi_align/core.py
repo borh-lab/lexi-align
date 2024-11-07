@@ -178,24 +178,30 @@ def align_tokens(
 
         except Exception as e:
             logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
-            # If we're on the last attempt, extract valid alignments
             if attempt == max_retries - 1:
-                unique_source = set(make_unique(source_tokens))
-                unique_target = set(make_unique(target_tokens))
-
-                valid_alignments = [
-                    align
-                    for align in result.alignment
-                    if align.source_token in unique_source
-                    and align.target_token in unique_target
-                ]
-
+                # On last attempt, try to extract any valid alignments from previous responses
+                valid_alignments = []
+                for msg in messages:
+                    if isinstance(msg, AssistantMessage) and hasattr(msg.content, "alignment"):
+                        result = msg.content
+                        unique_source = set(make_unique(source_tokens))
+                        unique_target = set(make_unique(target_tokens))
+                        
+                        valid_alignments.extend([
+                            align 
+                            for align in result.alignment
+                            if align.source_token in unique_source 
+                            and align.target_token in unique_target
+                        ])
+                
                 if valid_alignments:
                     logger.warning(
                         f"Returning {len(valid_alignments)} valid alignments after {max_retries} failed attempts"
                     )
                     return TextAlignment(alignment=valid_alignments)
-                raise
+                    
+                # If no valid alignments found, raise error
+                raise ValueError(f"Failed to get valid alignments after {max_retries} attempts") from e
 
     # If we get here and have no valid alignments, raise the error
     raise ValueError(

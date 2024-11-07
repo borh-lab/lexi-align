@@ -38,6 +38,7 @@ def test_split_model_detection():
     assert additional == ["model-00002-of-00003.gguf", "model-00003-of-00003.gguf"]
 
 
+@pytest.mark.llm
 @pytest.mark.slow
 @pytest.mark.skipif(
     not os.path.exists("qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf"),

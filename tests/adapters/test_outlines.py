@@ -8,6 +8,7 @@ from logging import getLogger
 logger = getLogger(__name__)
 
 
+@pytest.mark.llm
 @pytest.mark.slow
 def test_outlines_adapter():
     # Test with greedy sampling (temperature=0.0)
