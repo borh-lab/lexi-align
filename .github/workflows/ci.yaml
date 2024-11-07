@@ -23,7 +23,7 @@ jobs:
         run: uv sync --extra dev -p 3.12
       - name: Mypy
         # We disable this error in order to not have to install all deps for now
-        run: uv run mypy --disable-error-code=import-untyped src tests evaluations
+        run: uv run mypy --ignore-missing-imports src tests evaluations
       - name: pytest
         run: uv run pytest
       - name: lint
