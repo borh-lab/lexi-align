@@ -51,8 +51,14 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+    # All extra dependencies for ci and convenience
     "litellm>=1.51.0",
     "boto3>=1.35.50",
+    "llama-cpp-python>=0.3.1",
+    "outlines>=0.1.1",
+    "transformers>=4.46.1",
+    "torch>=2.5.1",
+    "accelerate>=1.0.1",
     # Eval
     "requests>=2.31.0",
     "matplotlib>=3.7.0",
