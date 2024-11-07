@@ -76,23 +76,29 @@ def align_tokens(
 
     def validate_alignment(
         alignment: TextAlignment, source_tokens: list[str], target_tokens: list[str]
-    ) -> tuple[bool, Optional[str]]:
+    ) -> tuple[bool, list[str]]:
         """Validate alignment against source and target tokens."""
         # Create sets of unique tokens for comparison
         unique_source = set(make_unique(source_tokens))
         unique_target = set(make_unique(target_tokens))
 
+        invalid_alignments = []
+
         # Check each alignment pair
         for align in alignment.alignment:
             # Check if source token exists in uniquified source tokens
             if align.source_token not in unique_source:
-                return False, f"Invalid source token: {align.source_token}"
+                invalid_alignments.append(
+                    f'Invalid source token in {align.model_dump_json()}: "{align.source_token}"'
+                )
 
             # Check if target token exists in uniquified target tokens
             if align.target_token not in unique_target:
-                return False, f"Invalid target token: {align.target_token}"
+                invalid_alignments.append(
+                    f'Invalid target token in {align.model_dump_json()}: "{align.target_token}"'
+                )
 
-        return True, None
+        return len(invalid_alignments) == 0, invalid_alignments
 
     messages: List[Message] = []
     messages.append(
@@ -149,27 +155,14 @@ def align_tokens(
             messages.append(AssistantMessage(result))
 
             # If invalid, add detailed error feedback and retry
-            logger.warning(f"Attempt {attempt + 1}: Invalid alignment: {error_msg}")
-
-            # Build list of problematic alignments
-            invalid_alignments = []
-            unique_source = set(make_unique(source_tokens))
-            unique_target = set(make_unique(target_tokens))
-
-            for align in result.alignment:
-                if align.source_token not in unique_source:
-                    invalid_alignments.append(
-                        f"TokenAlignment(source_token='{align.source_token}', target_token='{align.target_token}') - Invalid source token '{align.source_token}'"
-                    )
-                if align.target_token not in unique_target:
-                    invalid_alignments.append(
-                        f"TokenAlignment(source_token='{align.source_token}', target_token='{align.target_token}') - Invalid target token '{align.target_token}'"
-                    )
+            logger.warning(f"Attempt {attempt + 1}: Invalid alignments found")
+            for error in error_msg:
+                logger.warning(f"  {error}")
 
             messages.append(
                 UserMessage(
-                    f"The previous alignment was invalid. The following alignments contain invalid tokens:\n\n"
-                    f"{chr(10).join(invalid_alignments)}\n\n"
+                    f"The previous alignment was invalid. The following issues were found:\n\n"
+                    f"{chr(10).join(error_msg)}\n\n"
                     f"Please provide a new alignment using only these exact tokens:\n"
                     f"Source tokens: {make_unique(source_tokens)}\n"
                     f"Target tokens: {make_unique(target_tokens)}"
