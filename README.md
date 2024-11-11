@@ -65,7 +65,7 @@ from lexi_align.core import align_tokens
 
 # Initialize the LLM adapter
 llm_adapter = LiteLLMAdapter(model_params={
-    "model": "gpt-4",
+    "model": "gpt-4o",
     "temperature": 0.0
 })
 
@@ -73,13 +73,19 @@ llm_adapter = LiteLLMAdapter(model_params={
 source_tokens = ["the", "big", "cat", "saw", "the", "cat"]  # Note: "the" and "cat" appear twice
 target_tokens = ["le", "gros", "chat", "a", "vu", "le", "chat"]
 
-alignment = align_tokens(
+result = align_tokens(
     llm_adapter,
     source_tokens,
     target_tokens,
     source_language="English",
     target_language="French"
 )
+
+# Access the alignment result
+if result.alignment:
+    print("Successful alignment:")
+    for align in result.alignment.alignment:
+        print(f"{align.source_token} -> {align.target_token}")
 
 # Example output will show the uniquified tokens:
 # the₁ -> le₁
@@ -89,6 +95,111 @@ alignment = align_tokens(
 # saw -> vu
 # the₂ -> le₂
 # cat₂ -> chat₂
+```
+
+### Batched Processing
+
+**EXPERIMENTAL**
+
+For processing multiple sequences efficiently using Outlines (which supports native batching):
+
+```python
+from lexi_align.adapters.outlines_adapter import OutlinesAdapter
+from lexi_align.core import align_tokens_batched
+
+# Initialize adapter with a local model
+llm_adapter = OutlinesAdapter(
+    model_name="Qwen/Qwen2.5-1.5B-Instruct",  # or any local model path
+    dtype="bfloat16",  # optional: choose quantization
+    device="cuda"      # optional: specify device
+)
+
+# Multiple sequences to align
+source_sequences = [
+    ["The", "cat", "sat"],
+    ["I", "love", "coding"],
+]
+target_sequences = [
+    ["Le", "chat", "assis"],
+    ["J'", "aime", "coder"],
+]
+
+# Process in batches
+results = align_tokens_batched(
+    llm_adapter,
+    source_sequences,
+    target_sequences,
+    source_language="English",
+    target_language="French",
+    batch_size=2  # Process 2 sequences at a time
+)
+
+# Each result contains alignment and diagnostic information
+for result in results:
+    if result.alignment:
+        print(result.alignment.alignment)
+    else:
+        print("Failed attempts:", len(result.attempts))
+```
+
+### Async Processing
+
+For asynchronous processing:
+
+```python
+import asyncio
+from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
+from lexi_align.core import align_tokens_async
+
+async def align_async():
+    llm_adapter = LiteLLMAdapter(model_params={
+        "model": "gpt-4o",
+        "temperature": 0.0
+    })
+
+    source = ["The", "cat", "sat"]
+    target = ["Le", "chat", "assis"]
+
+    result = await align_tokens_async(
+        llm_adapter,
+        source,
+        target,
+        source_language="English",
+        target_language="French"
+    )
+
+    return result
+
+# Run async alignment
+result = asyncio.run(align_async())
+```
+
+### Diagnostic Information
+
+The alignment functions return an `AlignmentResult` object containing both the alignment and diagnostic information:
+
+```python
+result = align_tokens(
+    llm_adapter,
+    source_tokens,
+    target_tokens,
+    source_language="English",
+    target_language="French"
+)
+
+# Access the alignment
+if result.alignment:
+    print("Successful alignment:", result.alignment.alignment)
+
+# Access attempt history
+for attempt in result.attempts:
+    print(f"Attempt {attempt.attempt_number}:")
+    print("Messages sent:", attempt.messages_sent)
+    print("Validation passed:", attempt.validation_passed)
+    if attempt.validation_errors:
+        print("Validation errors:", attempt.validation_errors)
+    if attempt.exception:
+        print("Exception:", attempt.exception)
 ```
 
 ### Using Custom Guidelines and Examples
@@ -102,7 +213,7 @@ from lexi_align.models import TextAlignment, TokenAlignment
 
 # Initialize adapter as before
 llm_adapter = LiteLLMAdapter(model_params={
-    "model": "gpt-4",
+    "model": "gpt-4o",
     "temperature": 0.0
 })
 
@@ -247,7 +358,7 @@ alignment = align_tokens(
 
 ### Performance
 
-Here are some preliminary results on the test EN-SL subset of XL-WA:
+Here are some preliminary results on the test EN-SL subset of XL-WA (using the older 0.1.0 version):
 
 #### gpt-4o-2024-08-06 (1shot) (seed=42)
 
@@ -295,7 +406,7 @@ print(pharaoh_format)
 # Use custom separator
 pharaoh_format = export_pharaoh_format(
     source_tokens,
-    target_tokens, 
+    target_tokens,
     alignment,
     sep=" ||| "  # Custom separator
 )
@@ -327,7 +438,7 @@ python evaluations/xl-wa.py --lang-pairs all
 # Full evaluation with custom parameters
 python evaluations/xl-wa.py \
     --lang-pairs EN-FR EN-DE \
-    --model gpt-4 \
+    --model gpt-4o \
     --temperature 0.0 \
     --seed 42 \
     --num-train-examples 3 \
@@ -337,7 +448,7 @@ python evaluations/xl-wa.py \
 Available command-line arguments:
 
 - `--lang-pairs`: Language pairs to evaluate (e.g., EN-SL EN-DE) or "all"
-- `--model`: LLM model to use (default: gpt-4)
+- `--model`: LLM model to use (default: gpt-4o)
 - `--temperature`: Temperature for LLM sampling (default: 0.0)
 - `--seed`: Random seed for example selection (default: 42)
 - `--model-seed`: Seed for LLM sampling (optional)
@@ -346,10 +457,25 @@ Available command-line arguments:
 - `--output`: Path to save results JSON file
 - `--verbose`: Enable verbose logging
 
-## Planned improvements
+## Changelog
 
-- [x] structured generation support (adapter additions) for local models via [Outlines](https://github.com/dottxt-ai/outlines) and [llama.cpp GBNF](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md)
-- [x] retries on errors or invalid alignments
+### v0.3.0 (2024-03-11)
+- Added support for batched processing with `align_tokens_batched`
+- Added async support via `align_tokens_async`
+- Added enhanced diagnostics and error reporting
+- Added alignment visualization tools
+- Added token-level analysis and metrics
+- Added support for custom marker types (subscript/underscore)
+- Added support for custom separators in Pharaoh format
+- Improved retry logic and validation
+- Added CI and evaluation scripts
+
+### v0.2.x (2024-03-07)
+- Added support for local models via Outlines and llama.cpp
+- Added retries on errors or invalid alignments
+- Added async completion support for litellm
+- Added support for model weight quantization
+- Added improved error messages and validation
 
 ## License
 
