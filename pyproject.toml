@@ -1,6 +1,6 @@
 [project]
 name = "lexi-align"
-version = "0.2.3"
+version = "0.3.0"
 description = "Word alignment between two languages using structured generation"
 readme = "README.md"
 authors = [
@@ -16,18 +16,26 @@ litellm = ["litellm>=1.51.0"]
 outlines = [
     "outlines>=0.1.1",
     "transformers>=4.46.1",
-    "torch>=2.5.1",
     "accelerate>=1.0.1",
-    # If using ROCm:
+    "torch>=2.5.1",
+    # # If using ROCm:
     # "torch==2.5.1+rocm6.2",
     # "pytorch-triton-rocm==3.1.0",
 ]
 llama-cpp = ["llama-cpp-python>=0.3.1"]
+viz = [
+    "matplotlib>=3.9.2",
+    "seaborn>=0.13.2",
+]
 
 # The following is for different accelerators:
 [tool.uv.sources]
-# torch = { index = "pytorch-cuda", marker = "sys_platform != 'darwin'" }
-# pytorch-triton-rocm = { index = "pytorch-rocm", marker = "sys_platform != 'darwin'" }
+torch = { index = "pytorch-cuda" }
+# We leave this here because it does not interfere with other packages:
+pytorch-triton-rocm = { index = "pytorch-rocm" }
+# If wanting the development version:
+# outlines = { git = "https://github.com/dottxt-ai/outlines.git" }
+# If wanting to use CUDA wheels:
 # llama-cpp-python = { index = "llama-cpp-python-cuda" }
 
 [[tool.uv.index]]
@@ -72,4 +80,16 @@ dev = [
     "types-tqdm",
     "types-requests",
     "hf-transfer>=0.1.8",
+    "pytest-asyncio>=0.24.0",
+    "loguru>=0.7.2",
 ]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --doctest-modules"
+testpaths = [
+    "tests",
+    "src",
+]
+doctest_optionflags = "NORMALIZE_WHITESPACE IGNORE_EXCEPTION_DETAIL"
+asyncio_default_fixture_loop_scope = "function"
