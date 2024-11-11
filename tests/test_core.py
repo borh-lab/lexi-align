@@ -64,7 +64,7 @@ def test_align_tokens(source, target, source_lang, target_lang, expected, mock_r
     result = align_tokens(
         adapter, source_tokens, target_tokens, source_lang, target_lang
     )
-    assert result == expected_alignment
+    assert result.alignment == expected_alignment
 
 
 @pytest.mark.parametrize(
@@ -144,7 +144,7 @@ def test_align_tokens_raw(source, target, custom_messages, expected, mock_result
 
     adapter = TestMockLLMAdapter()
     result = align_tokens_raw(adapter, source_tokens, target_tokens, custom_messages)
-    assert result == expected_alignment
+    assert result.alignment == expected_alignment
 
 
 def test_align_tokens_error_handling():
@@ -154,10 +154,18 @@ def test_align_tokens_error_handling():
         def __call__(self, messages: list[dict]) -> TextAlignment:
             raise ValueError("Test error")
 
+        async def acall(self, messages: list[dict]) -> TextAlignment:
+            raise ValueError("Test error")
+
     error_adapter = ErrorAdapter()
 
-    with pytest.raises(ValueError):
-        align_tokens(error_adapter, ["test"], ["test"])
+    # Test that errors are captured in AlignmentResult
+    result = align_tokens(error_adapter, ["test"], ["test"])
+    assert result.alignment is None
+    assert len(result.attempts) > 0
+    assert result.attempts[0].exception == "Test error"
 
-    with pytest.raises(ValueError):
-        align_tokens_raw(error_adapter, ["test"], ["test"], [])
+    result = align_tokens_raw(error_adapter, ["test"], ["test"], [])
+    assert result.alignment is None
+    assert len(result.attempts) > 0
+    assert result.attempts[0].exception == "Test error"

@@ -36,6 +36,9 @@ class AssistantMessage:
             self.content = content
 
 
+Message = Union[SystemMessage, UserMessage, AssistantMessage]
+
+
 def format_messages(*messages) -> list[dict[str, str]]:
     # Handle both individual messages and lists of messages
     message_list: list[Any]
@@ -44,6 +47,26 @@ def format_messages(*messages) -> list[dict[str, str]]:
     else:
         message_list = list(messages)  # Convert tuple to list
     return [{"role": msg.role, "content": msg.content} for msg in message_list]
+
+
+def format_tokens(source_tokens: list[str], target_tokens: list[str]) -> str:
+    """Format source and target tokens for the LLM prompt.
+
+    Args:
+        source_tokens: List of source language tokens
+        target_tokens: List of target language tokens
+
+    Returns:
+        Formatted string with source and target tokens
+
+    Example:
+        >>> format_tokens(["the", "cat"], ["le", "chat"])
+        'Source tokens: the cat\\nTarget tokens: le chat'
+    """
+    return (
+        f"Source tokens: {' '.join(make_unique(source_tokens))}\n"
+        f"Target tokens: {' '.join(make_unique(target_tokens))}"
+    )
 
 
 STRIP_RE = re.compile(r"[^\w\s']")

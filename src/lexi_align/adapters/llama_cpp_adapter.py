@@ -57,7 +57,7 @@ class LlamaCppAdapter(LLMAdapter):
 
         Args:
             model_path: Path to model file (or any split GGUF file)
-            n_gpu_layers: Number of layers to offload to GPU (-1 for all)
+            n_gpu_layers: Number of layers to offload to GPU (set to high number such as 99 to use all layers)
             split_mode: How to split model across GPUs (1=layer-wise, 2=row-wise)
             main_gpu: Main GPU to use
             tensor_split: How to distribute tensors across GPUs

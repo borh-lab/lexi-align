@@ -12,6 +12,7 @@ def get_alignment_pairs(alignment: TextAlignment) -> Set[Tuple[str, str]]:
         Set of (source_token, target_token) tuples
 
     Example:
+        >>> from lexi_align.models import TextAlignment, TokenAlignment
         >>> alignment = TextAlignment(alignment=[
         ...     TokenAlignment(source_token="cat", target_token="chat"),
         ...     TokenAlignment(source_token="the", target_token="le")
@@ -34,6 +35,7 @@ def calculate_metrics(predicted: TextAlignment, gold: TextAlignment) -> dict:
         dict containing precision, recall, and f1 scores
 
     Example:
+        >>> from lexi_align.models import TextAlignment, TokenAlignment
         >>> pred = TextAlignment(alignment=[
         ...     TokenAlignment(source_token="the", target_token="le"),
         ...     TokenAlignment(source_token="cat", target_token="chat"),

@@ -1,11 +1,123 @@
 import pytest
 from lexi_align.adapters.outlines_adapter import OutlinesAdapter
-from lexi_align.core import align_tokens
-from lexi_align.models import TextAlignment, TokenAlignment
+from lexi_align.core import align_tokens, align_tokens_batched
+from lexi_align.models import TextAlignment, TokenAlignment, AlignmentResult
 from lexi_align.metrics import calculate_metrics
 from logging import getLogger
 
 logger = getLogger(__name__)
+
+
+def validate_alignment_tokens(
+    alignment: TextAlignment, src_tokens: list[str], tgt_tokens: list[str]
+):
+    """Helper function to validate alignment tokens."""
+    src_aligned = {align.source_token for align in alignment.alignment}
+    tgt_aligned = {align.target_token for align in alignment.alignment}
+    assert src_aligned.issubset(
+        set(src_tokens)
+    ), f"Aligned source tokens {src_aligned} not subset of input tokens {set(src_tokens)}"
+    assert tgt_aligned.issubset(
+        set(tgt_tokens)
+    ), f"Aligned target tokens {tgt_aligned} not subset of input tokens {set(tgt_tokens)}"
+
+
+@pytest.mark.llm
+@pytest.mark.slow
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 5])
+def test_outlines_adapter_different_batch_sizes(batch_size):
+    """Test that batching works correctly with different batch sizes."""
+    adapter = OutlinesAdapter(temperature=0.3, samples=1, batch_size=batch_size)
+
+    # Create fixed size input
+    source_tokens_batch = [
+        ["I", "see", "a", "dog"],
+        ["The", "cat", "sleeps"],
+        ["She", "runs", "fast"],
+        ["They", "eat", "lunch"],
+    ]
+    target_tokens_batch = [
+        ["Je", "vois", "un", "chien"],
+        ["Le", "chat", "dort"],
+        ["Elle", "court", "vite"],
+        ["Ils", "mangent", "déjeuner"],
+    ]
+
+    results = align_tokens_batched(
+        adapter,
+        source_tokens_batch,
+        target_tokens_batch,
+        source_language="English",
+        target_language="French",
+    )
+
+    # Results should be the same regardless of batch size
+    assert len(results) == len(source_tokens_batch)
+    for result, src, tgt in zip(results, source_tokens_batch, target_tokens_batch):
+        assert isinstance(result, AlignmentResult)
+        assert isinstance(result.alignment, TextAlignment)
+        assert result.alignment.alignment and len(result.alignment.alignment) > 0
+        validate_alignment_tokens(result.alignment, src, tgt)
+
+
+@pytest.mark.llm
+@pytest.mark.slow
+def test_outlines_adapter_empty_batch():
+    """Test handling of empty batch."""
+    adapter = OutlinesAdapter(temperature=0.3, samples=1, batch_size=2)
+
+    # Test with empty batch
+    results = align_tokens_batched(
+        adapter, [], [], source_language="English", target_language="French"
+    )
+    assert len(results) == 0
+    assert all(isinstance(r, AlignmentResult) for r in results)
+
+
+@pytest.mark.llm
+@pytest.mark.slow
+def test_outlines_adapter_single_item_batch():
+    """Test handling of single-item batch."""
+    adapter = OutlinesAdapter(temperature=0.3, samples=1, batch_size=2)
+
+    source_tokens_batch = [["Hello", "world"]]
+    target_tokens_batch = [["Bonjour", "monde"]]
+
+    results = align_tokens_batched(
+        adapter,
+        source_tokens_batch,
+        target_tokens_batch,
+        source_language="English",
+        target_language="French",
+    )
+
+    assert len(results) == 1
+    result = results[0]
+    assert isinstance(result, AlignmentResult)
+    assert result.alignment is not None
+    validate_alignment_tokens(
+        result.alignment, source_tokens_batch[0], target_tokens_batch[0]
+    )
+    assert isinstance(result, AlignmentResult)
+
+
+@pytest.mark.llm
+@pytest.mark.slow
+def test_outlines_adapter_batch_error_handling():
+    """Test error handling in batch processing."""
+    adapter = OutlinesAdapter(temperature=0.3, samples=1, batch_size=2)
+
+    # Test mismatched batch sizes
+    with pytest.raises(
+        ValueError, match="Number of source and target sequences must match"
+    ):
+        align_tokens_batched(
+            adapter,
+            [["Hello", "world"]],
+            [],
+            source_language="English",
+            target_language="French",
+        )
 
 
 @pytest.mark.llm
@@ -73,11 +185,12 @@ def test_outlines_adapter():
         (result_multinomial, "multinomial"),
     ]:
         # Validate the structure of the result
-        assert isinstance(result, TextAlignment)
-        assert len(result.alignment) > 0
+        assert isinstance(result, AlignmentResult)
+        assert isinstance(result.alignment, TextAlignment)
+        assert result.alignment.alignment and len(result.alignment.alignment) > 0
 
         # Calculate alignment quality metrics
-        metrics = calculate_metrics(result, expected)
+        metrics = calculate_metrics(result.alignment, expected)
 
         # Check if metrics meet minimum thresholds
         min_threshold = 0.25

@@ -1,6 +1,7 @@
-from typing import Optional, Any, Dict, Literal, cast
+from typing import Optional, Any, Dict, Literal, cast, Union
 from outlines.samplers import Sampler
 import torch
+import json
 import outlines
 from outlines import models, generate
 from transformers import AutoTokenizer, AutoConfig  # type: ignore
@@ -20,21 +21,38 @@ class OutlinesAdapter(LLMAdapter):
         # Sampling parameters
         temperature: float = 0.0,
         samples: int = 1,
+        batch_size: int = 5,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         beam_size: Optional[int] = None,
+        max_tokens: int = 2048,
         # Model configuration
         device: Optional[str] = None,
         dtype: Literal["float32", "float16", "bfloat16", "int8", "int4"] = "bfloat16",
         model_kwargs: Optional[Dict[str, Any]] = None,
         **transformers_kwargs: Any,
     ):
-        """Initialize the adapter with an Outlines model."""
+        """Initialize the adapter with an Outlines model.
+
+        Args:
+            model_name: Name/path of the model to load
+            temperature: Sampling temperature (0.0 for greedy)
+            samples: Number of samples for multinomial sampling
+            top_k: Top-k filtering parameter
+            top_p: Top-p filtering parameter
+            beam_size: Number of beams for beam search
+            max_tokens: Maximum number of new tokens to generate (passed as max_new_tokens to outlines)
+            device: Device to run model on ('cuda' or 'cpu')
+            dtype: Model weight data type
+            model_kwargs: Additional kwargs for model initialization
+            transformers_kwargs: Additional kwargs for transformers.AutoModelForCausalLM.from_pretrained()
+        """
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         self.model_kwargs = model_kwargs or {}
         self.transformers_kwargs = transformers_kwargs
+        self._batch_size = batch_size
 
         # Store sampling parameters
         self.samples = samples
@@ -42,6 +60,7 @@ class OutlinesAdapter(LLMAdapter):
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+        self.max_tokens = max_tokens
 
         # Initialize tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -183,6 +202,74 @@ class OutlinesAdapter(LLMAdapter):
         assert self._generator is not None
         return self._generator
 
+    def batch(
+        self,
+        batch_messages: list[list[dict]],
+        max_retries: int = 3,
+    ) -> list[Optional[TextAlignment]]:
+        """Generate alignments for a batch of message sequences.
+
+        Args:
+            batch_messages: List of message sequences to process
+            max_retries: Maximum number of retries per sequence
+
+        Returns:
+            List of TextAlignment objects or None for failed generations
+        """
+        results: list[Optional[TextAlignment]] = []
+
+        # Format all prompts at once
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
+            for messages in batch_messages
+        ]
+
+        success = False
+        last_error: Optional[Union[json.JSONDecodeError, Exception]] = None
+
+        # Try up to max_retries times for the entire batch
+        for attempt in range(max_retries):
+            try:
+                # Process all prompts in a single generator call
+                batch_results = self.generator(
+                    prompts,
+                    max_tokens=self.max_tokens,
+                )
+                # batch_results should be a list of TextAlignment objects
+                results = [cast(TextAlignment, result) for result in batch_results]
+                success = True
+                break
+
+            except json.JSONDecodeError as e:
+                context = e.doc[max(0, e.pos - 50) : min(len(e.doc), e.pos + 50)]
+                logger.warning(
+                    f"JSON decode error near position {e.pos}. Context: '...{context}...'\n"
+                    "Increasing max_tokens and retrying..."
+                )
+                self.max_tokens *= 2  # Double max_tokens on JSON errors
+                last_error = e
+
+            except Exception as e:
+                logger.warning(
+                    f"Attempt {attempt + 1} failed ({type(e).__name__}): {str(e)}"
+                )
+                last_error = e
+
+        if not success:
+            logger.error(
+                f"All attempts failed for batch. Last error: {str(last_error)}"
+            )
+            # Return None for each sequence in the batch
+            results = [None] * len(batch_messages)
+
+        return results
+
+    def supports_true_batching(self) -> bool:
+        """Indicate that this adapter supports efficient batching."""
+        return True
+
     def __call__(self, messages: list[dict]) -> TextAlignment:
         """Generate alignments using the Outlines model."""
         # Apply chat template to convert messages to the model's expected format
@@ -192,6 +279,9 @@ class OutlinesAdapter(LLMAdapter):
         logger.debug(f"Formatted prompt: {prompt}")
 
         # Use cached generator
-        # Use cached generator
-        result = self.generator(prompt)
+        result = self.generator(
+            prompt,
+            max_tokens=self.max_tokens,
+        )
+
         return cast(TextAlignment, result)
