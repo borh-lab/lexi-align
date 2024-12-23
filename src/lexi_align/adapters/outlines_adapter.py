@@ -1,13 +1,22 @@
-from typing import Optional, Any, Dict, Literal, cast, Union
-from outlines.samplers import Sampler
-import torch
 import json
-import outlines
-from outlines import models, generate
-from transformers import AutoTokenizer, AutoConfig  # type: ignore
-from lexi_align.adapters import LLMAdapter
-from lexi_align.models import TextAlignment
 from logging import getLogger
+from typing import Any, Dict, List, Literal, Optional, Type, cast
+
+import outlines
+import torch
+from outlines import generate, models
+from outlines.samplers import Sampler
+from transformers import AutoConfig, AutoTokenizer  # type: ignore
+
+from lexi_align.adapters import LLMAdapter
+from lexi_align.models import (
+    UNALIGNED_MARKER,
+    TextAlignment,
+    TextAlignmentSchema,
+    TokenAlignment,
+    calculate_max_alignments,
+    create_dynamic_alignment_schema,
+)
 
 logger = getLogger(__name__)
 
@@ -25,7 +34,7 @@ class OutlinesAdapter(LLMAdapter):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         beam_size: Optional[int] = None,
-        max_tokens: int = 2048,
+        max_tokens: int = 4096,
         # Model configuration
         device: Optional[str] = None,
         dtype: Literal["float32", "float16", "bfloat16", "int8", "int4"] = "bfloat16",
@@ -69,7 +78,8 @@ class OutlinesAdapter(LLMAdapter):
 
         # Initialize other components lazily
         self._model = None
-        self._generator: Optional[Any] = None
+        self._sampler: Optional[Any] = None
+        self.include_schema = True  # Default to True for local models
 
     def _get_model(self):
         """Initialize model with appropriate configuration."""
@@ -102,7 +112,7 @@ class OutlinesAdapter(LLMAdapter):
                 kwargs = {
                     "config": config,
                     "trust_remote_code": True,
-                    "torch_dtype": torch.bfloat16,
+                    "torch_dtype": torch.float16,  # Changed from bfloat16 to float16
                     "device_map": {"": 0},
                     "quantization_config": quantization_config,
                 }
@@ -172,19 +182,18 @@ class OutlinesAdapter(LLMAdapter):
         return self._model
 
     @property
-    def generator(self) -> Any:
-        """Lazy initialization of the generator with appropriate sampler."""
-        if self._generator is None:
+    def sampler(self) -> Any:
+        """Lazy initialization of the sampler."""
+        if self._sampler is None:
             # Choose sampler based on parameters
-            sampler: Sampler
             if self.beam_size is not None:
-                sampler = cast(
+                self._sampler = cast(
                     Sampler, outlines.samplers.beam_search(beams=self.beam_size)
                 )
             elif self.temperature == 0.0:
-                sampler = cast(Sampler, outlines.samplers.greedy())
+                self._sampler = cast(Sampler, outlines.samplers.greedy())
             else:
-                sampler = cast(
+                self._sampler = cast(
                     Sampler,
                     outlines.samplers.multinomial(
                         self.samples,
@@ -194,94 +203,292 @@ class OutlinesAdapter(LLMAdapter):
                     ),
                 )
 
-            self._generator = generate.json(
-                self.model,
-                TextAlignment,
-                sampler=sampler,
+        return self._sampler
+
+    def _extract_tokens_from_messages(
+        self, messages: list[dict]
+    ) -> tuple[list[str], list[str], bool]:
+        """Extract source and target tokens from messages.
+
+        Args:
+            messages: List of message dictionaries
+
+        Returns:
+            Tuple of (source_tokens, target_tokens, is_retry)
+            The tokens returned are always the complete set, even for retry attempts,
+            since tokens may participate in multiple alignments.
+
+        Raises:
+            ValueError: If tokens cannot be found in messages
+        """
+        source_tokens = []
+        target_tokens = []
+        is_retry = False
+
+        # First find the initial complete token lists
+        for message in reversed(messages):
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                continue
+
+            lines = content.split("\n")
+            if len(lines) >= 2:
+                if lines[0].startswith("Source tokens: ") and lines[1].startswith(
+                    "Target tokens: "
+                ):
+                    source_tokens = lines[0].replace("Source tokens: ", "").split()
+                    target_tokens = lines[1].replace("Target tokens: ", "").split()
+                    break
+
+        if not source_tokens or not target_tokens:
+            raise ValueError(
+                "Could not find original source and target tokens in messages"
             )
-        assert self._generator is not None
-        return self._generator
+
+        # Then check if this is a retry attempt
+        for message in reversed(messages):
+            content = message.get("content", "")
+            if (
+                isinstance(content, str)
+                and "Please provide alignments for the remaining tokens:" in content
+            ):
+                is_retry = True
+                break
+
+        return source_tokens, target_tokens, is_retry
+
+    def _get_schema_class(
+        self,
+        source_tokens: list[str],
+        target_tokens: list[str],
+        is_retry: bool = False,
+        existing_alignments: Optional[List[TokenAlignment]] = None,
+    ) -> Type[TextAlignmentSchema]:
+        """Get appropriate schema class with length constraints.
+
+        Args:
+            source_tokens: List of source tokens
+            target_tokens: List of target tokens
+            is_retry: Whether this is a retry attempt
+            existing_alignments: Optional list of existing valid alignments
+
+        Returns:
+            Schema class to use for validation
+        """
+        if not self.supports_length_constraints():
+            return TextAlignmentSchema
+
+        if is_retry and existing_alignments:
+            # Calculate remaining unaligned tokens
+            aligned_source = {
+                align.source
+                for align in existing_alignments
+                if align.source != UNALIGNED_MARKER
+            }
+            aligned_target = {
+                align.target
+                for align in existing_alignments
+                if align.target != UNALIGNED_MARKER
+            }
+
+            remaining_source = set(source_tokens) - aligned_source
+            remaining_target = set(target_tokens) - aligned_target
+
+            # Scale length constraints based on remaining tokens
+            min_length = min(len(remaining_source), len(remaining_target))
+            max_length = calculate_max_alignments(
+                list(remaining_source), list(remaining_target)
+            )
+        else:
+            # For initial attempts, use full token sets
+            min_length = min(len(source_tokens), len(target_tokens))
+            max_length = calculate_max_alignments(source_tokens, target_tokens)
+
+        return create_dynamic_alignment_schema(
+            source_tokens,  # Always pass full token lists for enums
+            target_tokens,  # Always pass full token lists for enums
+            min_length=min_length,
+            max_length=max_length,
+        )
 
     def batch(
         self,
         batch_messages: list[list[dict]],
         max_retries: int = 3,
     ) -> list[Optional[TextAlignment]]:
-        """Generate alignments for a batch of message sequences.
+        """Generate alignments for a batch of message sequences."""
+        try:
+            # Format all prompts and create schemas
+            prompts: list[str] = []
+            schema_classes: list[Type[TextAlignmentSchema]] = []
 
-        Args:
-            batch_messages: List of message sequences to process
-            max_retries: Maximum number of retries per sequence
+            for messages in batch_messages:
+                try:
+                    source_tokens, target_tokens, is_retry = (
+                        self._extract_tokens_from_messages(messages)
+                    )
 
-        Returns:
-            List of TextAlignment objects or None for failed generations
-        """
-        results: list[Optional[TextAlignment]] = []
+                    # Extract existing alignments if this is a retry
+                    existing_alignments = None
+                    if is_retry:
+                        for message in reversed(messages):
+                            if isinstance(
+                                message.get("content"), str
+                            ) and "Here are partial alignments:" in message.get(
+                                "content", ""
+                            ):
+                                try:
+                                    content = message["content"]
+                                    alignment_start = content.find('{"alignment":')
+                                    alignment_end = content.find("\n", alignment_start)
+                                    if alignment_end == -1:
+                                        alignment_end = len(content)
+                                    alignment_json = content[
+                                        alignment_start:alignment_end
+                                    ]
+                                    partial_alignment = TextAlignment.parse_raw(
+                                        alignment_json
+                                    )
+                                    existing_alignments = partial_alignment.alignment
+                                    break
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Failed to parse existing alignments: {e}"
+                                    )
 
-        # Format all prompts at once
-        prompts = [
-            self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False
-            )
-            for messages in batch_messages
-        ]
+                    schema_class = self._get_schema_class(
+                        source_tokens, target_tokens, is_retry, existing_alignments
+                    )
+                except ValueError:
+                    logger.warning(f"Could not find tokens in messages: {messages}")
+                    schema_class = TextAlignmentSchema
 
-        success = False
-        last_error: Optional[Union[json.JSONDecodeError, Exception]] = None
+                schema_classes.append(schema_class)
 
-        # Try up to max_retries times for the entire batch
-        for attempt in range(max_retries):
-            try:
-                # Process all prompts in a single generator call
-                batch_results = self.generator(
-                    prompts,
-                    max_tokens=self.max_tokens,
+                # Format prompt
+                prompt = self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False
                 )
-                # batch_results should be a list of TextAlignment objects
-                results = [cast(TextAlignment, result) for result in batch_results]
-                success = True
-                break
+                prompts.append(prompt)
 
-            except json.JSONDecodeError as e:
-                context = e.doc[max(0, e.pos - 50) : min(len(e.doc), e.pos + 50)]
-                logger.warning(
-                    f"JSON decode error near position {e.pos}. Context: '...{context}...'\n"
-                    "Increasing max_tokens and retrying..."
-                )
-                self.max_tokens *= 2  # Double max_tokens on JSON errors
-                last_error = e
+            # Process prompts with their corresponding schemas
+            batch_results: list[Optional[TextAlignment]] = []
+            for i, (prompt, schema_class) in enumerate(zip(prompts, schema_classes)):
+                try:
+                    generator = generate.json(
+                        self.model,
+                        schema_class,
+                        sampler=self.sampler,
+                    )
+                    result = generator(prompt, max_tokens=self.max_tokens)
 
-            except Exception as e:
-                logger.warning(
-                    f"Attempt {attempt + 1} failed ({type(e).__name__}): {str(e)}"
-                )
-                last_error = e
+                    # Add detailed logging of what we received
+                    logger.debug(f"Result {i} type: {type(result)}")
+                    logger.debug(f"Result {i} content: {result}")
 
-        if not success:
+                    # Convert result to proper TextAlignment
+                    if isinstance(result, TextAlignmentSchema) and not isinstance(
+                        result, TextAlignment
+                    ):
+                        batch_results.append(TextAlignment(alignment=result.alignment))
+                    elif isinstance(result, TextAlignment):
+                        batch_results.append(result)
+                    else:
+                        logger.error(
+                            f"Invalid result type: {type(result)}, expected TextAlignment"
+                        )
+                        batch_results.append(None)
+                except Exception as e:
+                    logger.error(
+                        f"Error processing prompt {i}:\n"
+                        f"Error type: {type(e).__name__}\n"
+                        f"Error message: {str(e)}\n"
+                        f"Stack trace:",
+                        exc_info=True,
+                    )
+                    batch_results.append(None)
+
+            return batch_results
+
+        except json.JSONDecodeError as e:
+            context = e.doc[max(0, e.pos - 50) : min(len(e.doc), e.pos + 50)]
             logger.error(
-                f"All attempts failed for batch. Last error: {str(last_error)}"
+                f"JSON decode error processing batch:\n"
+                f"Error: {str(e)}\n"
+                f"Position: {e.pos}\n"
+                f"Context: '...{context}...'\n"
+                f"Raw document: {e.doc}\n"
+                f"Stack trace:",
+                exc_info=True,
             )
-            # Return None for each sequence in the batch
-            results = [None] * len(batch_messages)
+            return [None] * len(batch_messages)
 
-        return results
+        except Exception as e:
+            logger.error(
+                f"Batch processing failed:\n"
+                f"Error type: {type(e).__name__}\n"
+                f"Error message: {str(e)}\n"
+                f"Number of messages in batch: {len(batch_messages)}\n"
+                f"Prompts: {prompts}\n"
+                f"Stack trace:",
+                exc_info=True,
+            )
+            return [None] * len(batch_messages)
 
     def supports_true_batching(self) -> bool:
         """Indicate that this adapter supports efficient batching."""
         return True
 
+    def supports_length_constraints(self) -> bool:
+        """Indicate that this adapter supports alignment length constraints."""
+        return True
+
     def __call__(self, messages: list[dict]) -> TextAlignment:
         """Generate alignments using the Outlines model."""
-        # Apply chat template to convert messages to the model's expected format
+        source_tokens, target_tokens, is_retry = self._extract_tokens_from_messages(
+            messages
+        )
+
+        # Extract existing alignments if this is a retry
+        existing_alignments = None
+        if is_retry:
+            for message in reversed(messages):
+                if isinstance(
+                    message.get("content"), str
+                ) and "Here are partial alignments:" in message.get("content", ""):
+                    try:
+                        content = message["content"]
+                        alignment_start = content.find('{"alignment":')
+                        alignment_end = content.find("\n", alignment_start)
+                        if alignment_end == -1:
+                            alignment_end = len(content)
+                        alignment_json = content[alignment_start:alignment_end]
+                        partial_alignment = TextAlignment.parse_raw(alignment_json)
+                        existing_alignments = partial_alignment.alignment
+                        break
+                    except Exception as e:
+                        logger.warning(f"Failed to parse existing alignments: {e}")
+
         prompt = self.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False
         )
-        logger.debug(f"Formatted prompt: {prompt}")
+        logger.debug(f"# Formatted prompt: {prompt}")
 
-        # Use cached generator
-        result = self.generator(
-            prompt,
-            max_tokens=self.max_tokens,
+        schema_class = self._get_schema_class(
+            source_tokens, target_tokens, is_retry, existing_alignments
         )
+        logger.debug(f"# Schema class: {schema_class}")
 
+        generator = generate.json(
+            self.model,
+            schema_class,
+            sampler=self.sampler,
+        )
+        result = generator(prompt, max_tokens=self.max_tokens)
+
+        # Convert to TextAlignment if needed
+        if isinstance(result, TextAlignmentSchema) and not isinstance(
+            result, TextAlignment
+        ):
+            return TextAlignment(alignment=result.alignment)
         return cast(TextAlignment, result)

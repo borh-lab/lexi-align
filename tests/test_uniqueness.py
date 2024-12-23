@@ -1,13 +1,14 @@
 import pytest
+
+from lexi_align.models import TextAlignment, TokenAlignment
+from lexi_align.text_processing import create_subscript_generator
 from lexi_align.utils import (
+    export_pharaoh_format,
     make_unique,
+    parse_pharaoh_format,
     remove_unique,
     remove_unique_one,
-    export_pharaoh_format,
-    parse_pharaoh_format,
 )
-from lexi_align.text_processing import create_subscript_generator
-from lexi_align.models import TextAlignment, TokenAlignment
 
 
 def test_make_unique_basic():
@@ -122,14 +123,14 @@ def test_pharaoh_format_uniqueness():
 
     alignment = TextAlignment(
         alignment=[
-            TokenAlignment(source_token="the₁", target_token="le₁"),
-            TokenAlignment(source_token="big", target_token="gros"),
-            TokenAlignment(source_token="cat₁", target_token="chat₁"),
+            TokenAlignment(source="the₁", target="le₁"),
+            TokenAlignment(source="big", target="gros"),
+            TokenAlignment(source="cat₁", target="chat₁"),
             # Split multi-word alignment into separate token alignments
-            TokenAlignment(source_token="saw", target_token="a"),
-            TokenAlignment(source_token="saw", target_token="vu"),
-            TokenAlignment(source_token="the₂", target_token="le₂"),
-            TokenAlignment(source_token="cat₂", target_token="chat₂"),
+            TokenAlignment(source="saw", target="a"),
+            TokenAlignment(source="saw", target="vu"),
+            TokenAlignment(source="the₂", target="le₂"),
+            TokenAlignment(source="cat₂", target="chat₂"),
         ]
     )
 

@@ -1,9 +1,11 @@
 import re
-from typing import Optional, Any, List, cast, Tuple
-from llama_cpp import Llama
-from lexi_align.adapters import LLMAdapter
-from lexi_align.models import TextAlignment
 from logging import getLogger
+from typing import Any, List, Optional, Tuple, cast
+
+from llama_cpp import Llama
+
+from lexi_align.adapters import LLMAdapter
+from lexi_align.models import TextAlignment, TextAlignmentSchema
 
 logger = getLogger(__name__)
 
@@ -51,6 +53,7 @@ class LlamaCppAdapter(LLMAdapter):
         verbose: bool = False,
         repo_id: Optional[str] = None,
         tokenizer_repo_id: Optional[str] = None,
+        enforce_length_constraints: bool = False,
         **kwargs: Any,
     ):
         """Initialize the adapter with a llama.cpp model.
@@ -84,6 +87,7 @@ class LlamaCppAdapter(LLMAdapter):
 
         # Initialize components lazily
         self._model: Optional[Llama] = None
+        self.include_schema = True  # Default to True for local models
 
     @property
     def model(self) -> Llama:
@@ -143,6 +147,10 @@ class LlamaCppAdapter(LLMAdapter):
 
         return "".join(formatted)
 
+    def supports_length_constraints(self) -> bool:
+        """Indicate that this adapter supports alignment length constraints."""
+        return True
+
     def __call__(self, messages: list[dict]) -> TextAlignment:
         """Generate alignments using the llama.cpp model."""
         from outlines import generate
@@ -156,7 +164,7 @@ class LlamaCppAdapter(LLMAdapter):
         model = LlamaCpp(self.model)
         generator = generate.json(
             model,
-            TextAlignment,
+            TextAlignmentSchema,
         )
 
         return cast(TextAlignment, generator(prompt))

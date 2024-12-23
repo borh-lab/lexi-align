@@ -1,71 +1,74 @@
 from lexi_align.models import TextAlignment
-from typing import Set, Tuple
 
 
-def get_alignment_pairs(alignment: TextAlignment) -> Set[Tuple[str, str]]:
-    """Convert TextAlignment into a set of (source, target) token pairs.
-
-    Args:
-        alignment: TextAlignment object to convert
-
-    Returns:
-        Set of (source_token, target_token) tuples
-
-    Example:
-        >>> from lexi_align.models import TextAlignment, TokenAlignment
-        >>> alignment = TextAlignment(alignment=[
-        ...     TokenAlignment(source_token="cat", target_token="chat"),
-        ...     TokenAlignment(source_token="the", target_token="le")
-        ... ])
-        >>> pairs = get_alignment_pairs(alignment)
-        >>> sorted(pairs)  # Sort for consistent output
-        [('cat', 'chat'), ('the', 'le')]
-    """
-    return {(a.source_token, a.target_token) for a in alignment.alignment}
-
-
-def calculate_metrics(predicted: TextAlignment, gold: TextAlignment) -> dict:
-    """Calculate Precision, Recall, and F1 score for token alignments.
+def calculate_metrics(
+    predicted: TextAlignment, gold: TextAlignment, f_alpha: float = 0.5
+) -> dict:
+    """Calculate alignment metrics following standard word alignment evaluation.
 
     Args:
         predicted: The system-generated alignment
-        gold: The gold-standard alignment
+        gold: The gold-standard alignment (treated as both sure and possible alignments)
+        f_alpha: Weight parameter for F-measure calculation (default: 0.5 for F1)
 
     Returns:
-        dict containing precision, recall, and f1 scores
+        dict containing precision, recall, f_measure, aer and alignment statistics
 
     Example:
         >>> from lexi_align.models import TextAlignment, TokenAlignment
         >>> pred = TextAlignment(alignment=[
-        ...     TokenAlignment(source_token="the", target_token="le"),
-        ...     TokenAlignment(source_token="cat", target_token="chat"),
-        ...     TokenAlignment(source_token="is", target_token="est")
+        ...     TokenAlignment(source="the", target="le"),
+        ...     TokenAlignment(source="cat", target="chat")
         ... ])
         >>> gold = TextAlignment(alignment=[
-        ...     TokenAlignment(source_token="the", target_token="le"),
-        ...     TokenAlignment(source_token="cat", target_token="chat"),
-        ...     TokenAlignment(source_token="is", target_token="wrong")
+        ...     TokenAlignment(source="the", target="le"),
+        ...     TokenAlignment(source="cat", target="chat"),
+        ...     TokenAlignment(source="!", target="!")
         ... ])
         >>> metrics = calculate_metrics(pred, gold)
-        >>> f"{metrics['precision']:.2f}"
-        '0.67'
-        >>> f"{metrics['recall']:.2f}"
-        '0.67'
-        >>> f"{metrics['f1']:.2f}"
-        '0.67'
+        >>> print(f"Precision: {metrics['precision']:.2f}")
+        Precision: 1.00
+        >>> print(f"Recall: {metrics['recall']:.2f}")
+        Recall: 0.67
+        >>> print(f"AER: {metrics['aer']:.2f}")
+        AER: 0.20
     """
-    pred_pairs = get_alignment_pairs(predicted)
-    gold_pairs = get_alignment_pairs(gold)
+    # Convert alignments to sets of pairs
+    A = {(a.source, a.target) for a in predicted.alignment}
+    # In our case, S = P since we don't distinguish sure/possible alignments
+    S = P = {(a.source, a.target) for a in gold.alignment}
 
-    # Calculate true positives (correct alignments)
-    true_positives = len(pred_pairs.intersection(gold_pairs))
+    # Calculate intersection sizes
+    a_intersect_p = len(A & P)
+    a_intersect_s = len(A & S)
 
-    precision = true_positives / len(pred_pairs) if pred_pairs else 0.0
-    recall = true_positives / len(gold_pairs) if gold_pairs else 0.0
-    f1 = (
-        2 * (precision * recall) / (precision + recall)
-        if (precision + recall) > 0
-        else 0.0
+    # Calculate metrics following standard formulas
+    precision = a_intersect_p / len(A) if A else 0.0
+    recall = a_intersect_s / len(S) if S else 0.0
+
+    # Calculate AER (Alignment Error Rate)
+    aer = (
+        1.0 - ((a_intersect_p + a_intersect_s) / (len(A) + len(S)))
+        if (len(A) + len(S)) > 0
+        else 1.0
     )
 
-    return {"precision": precision, "recall": recall, "f1": f1}
+    # Calculate weighted F-measure
+    if f_alpha < 0.0:
+        f_measure = 0.0
+    else:
+        if precision > 0 and recall > 0:
+            f_divident = (f_alpha / precision) + ((1.0 - f_alpha) / recall)
+            f_measure = 1.0 / f_divident
+        else:
+            f_measure = 0.0
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f_measure": f_measure,
+        "aer": aer,
+        "true_positives": a_intersect_s,  # Same as a_intersect_p in our case
+        "predicted": len(A),
+        "gold": len(S),
+    }

@@ -1,16 +1,17 @@
 try:
-    from litellm import completion, acompletion
+    from litellm import acompletion, completion
 except ImportError:
     raise ImportError(
         "litellm not installed. Install directly or using 'pip install lexi-align[litellm]'"
     )
 
-from typing import Optional, Any
 from logging import getLogger
-import litellm
-from lexi_align.adapters.base import LLMAdapter
-from lexi_align.models import TextAlignment
+from typing import Any, Optional
 
+import litellm
+
+from lexi_align.adapters.base import LLMAdapter
+from lexi_align.models import TextAlignment, TextAlignmentSchema
 
 logger = getLogger(__name__)
 
@@ -21,11 +22,16 @@ class LiteLLMAdapter(LLMAdapter):
     def __init__(self, model_params: Optional[dict[str, Any]] = None):
         """Initialize the adapter with model parameters."""
         self.model_params = model_params or {}
+        self.include_schema = False  # Schema is passed directly to the model's structured generation feature
 
     async def acall(self, messages: list[dict]) -> TextAlignment:
         """Async version using acompletion."""
         try:
-            response = await acompletion(messages=messages, **self.model_params)
+            response = await acompletion(
+                messages=messages,
+                response_format=TextAlignmentSchema,
+                **self.model_params,
+            )
 
             # Extract the response content
             content = response.choices[0].message.content
@@ -40,7 +46,11 @@ class LiteLLMAdapter(LLMAdapter):
     def __call__(self, messages: list[dict]) -> TextAlignment:
         """Synchronous version using completion."""
         try:
-            response = completion(messages=messages, **self.model_params)
+            response = completion(
+                messages=messages,
+                response_format=TextAlignmentSchema,
+                **self.model_params,
+            )
 
             # Extract the response content
             content = response.choices[0].message.content

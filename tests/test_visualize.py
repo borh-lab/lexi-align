@@ -1,8 +1,10 @@
-from lexi_align.visualize import visualize_alignments
-from lexi_align.models import TextAlignment, TokenAlignment
-import matplotlib.pyplot as plt
-import tempfile
 import os
+import tempfile
+
+import matplotlib.pyplot as plt
+
+from lexi_align.models import TextAlignment, TokenAlignment
+from lexi_align.visualize import visualize_alignments
 
 
 def test_visualize_alignments_basic(sample_tokens, sample_alignments):
@@ -107,9 +109,7 @@ def test_visualize_alignments_invalid_tokens():
 
     invalid_alignments = {
         "model1": TextAlignment(
-            alignment=[
-                TokenAlignment(source_token="invalid", target_token="nonexistent")
-            ]
+            alignment=[TokenAlignment(source="invalid", target="nonexistent")]
         )
     }
 
@@ -146,14 +146,14 @@ def test_visualize_alignments_unique_labels():
     alignments = {
         "model1": TextAlignment(
             alignment=[
-                TokenAlignment(source_token="the", target_token="le"),
-                TokenAlignment(source_token="cat", target_token="chat"),
+                TokenAlignment(source="the", target="le"),
+                TokenAlignment(source="cat", target="chat"),
             ]
         ),
         "model2": TextAlignment(
             alignment=[
-                TokenAlignment(source_token="the", target_token="le"),
-                TokenAlignment(source_token="cat", target_token="chat"),
+                TokenAlignment(source="the", target="le"),
+                TokenAlignment(source="cat", target="chat"),
             ]
         ),
     }

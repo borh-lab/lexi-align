@@ -1,4 +1,5 @@
 import pytest
+
 from lexi_align.models import TextAlignment, TokenAlignment
 
 
@@ -18,9 +19,9 @@ def pytest_configure(config):
 def sample_alignment():
     return TextAlignment(
         alignment=[
-            TokenAlignment(source_token="The", target_token="Le"),
-            TokenAlignment(source_token="cat", target_token="chat"),
-            TokenAlignment(source_token="sat", target_token="assis"),
+            TokenAlignment(source="The", target="Le"),
+            TokenAlignment(source="cat", target="chat"),
+            TokenAlignment(source="sat", target="assis"),
         ]
     )
 
@@ -30,15 +31,15 @@ def sample_alignments():
     return {
         "model1": TextAlignment(
             alignment=[
-                TokenAlignment(source_token="The", target_token="Le"),
-                TokenAlignment(source_token="cat", target_token="chat"),
+                TokenAlignment(source="The", target="Le"),
+                TokenAlignment(source="cat", target="chat"),
             ]
         ),
         "model2": TextAlignment(
             alignment=[
-                TokenAlignment(source_token="The", target_token="Le"),
-                TokenAlignment(source_token="cat", target_token="chat"),
-                TokenAlignment(source_token="sat", target_token="assis"),
+                TokenAlignment(source="The", target="Le"),
+                TokenAlignment(source="cat", target="chat"),
+                TokenAlignment(source="sat", target="assis"),
             ]
         ),
     }

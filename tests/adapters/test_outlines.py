@@ -1,9 +1,11 @@
+from logging import getLogger
+
 import pytest
+
 from lexi_align.adapters.outlines_adapter import OutlinesAdapter
 from lexi_align.core import align_tokens, align_tokens_batched
-from lexi_align.models import TextAlignment, TokenAlignment, AlignmentResult
 from lexi_align.metrics import calculate_metrics
-from logging import getLogger
+from lexi_align.models import AlignmentResult, TextAlignment, TokenAlignment
 
 logger = getLogger(__name__)
 
@@ -94,7 +96,15 @@ def test_outlines_adapter_single_item_batch():
     assert len(results) == 1
     result = results[0]
     assert isinstance(result, AlignmentResult)
-    assert result.alignment is not None
+    assert result.alignment is not None, (
+        f"Alignment failed after {len(result.attempts)} attempts.\n"
+        f"Last attempt details:\n"
+        f"- Raw response type: {type(result.attempts[-1].raw_response)}\n"
+        f"- Raw response: {result.attempts[-1].raw_response}\n"
+        f"- Validation errors: {[f'{err[0]}: {err[1]}' for err in result.attempts[-1].validation_errors]}\n"
+        f"- Exception: {result.attempts[-1].exception}\n\n"
+        f"First message sent:\n{result.attempts[0].messages_sent[0]}"
+    )
     validate_alignment_tokens(
         result.alignment, source_tokens_batch[0], target_tokens_batch[0]
     )
@@ -136,8 +146,8 @@ def test_outlines_adapter():
             "Le chat".split(),
             TextAlignment(
                 alignment=[
-                    TokenAlignment(source_token="The", target_token="Le"),
-                    TokenAlignment(source_token="cat", target_token="chat"),
+                    TokenAlignment(source="The", target="Le"),
+                    TokenAlignment(source="cat", target="chat"),
                 ]
             ),
         )
@@ -152,10 +162,10 @@ def test_outlines_adapter():
     # Expected alignment
     expected = TextAlignment(
         alignment=[
-            TokenAlignment(source_token="I", target_token="Je"),
-            TokenAlignment(source_token="see", target_token="vois"),
-            TokenAlignment(source_token="a", target_token="un"),
-            TokenAlignment(source_token="dog", target_token="chien"),
+            TokenAlignment(source="I", target="Je"),
+            TokenAlignment(source="see", target="vois"),
+            TokenAlignment(source="a", target="un"),
+            TokenAlignment(source="dog", target="chien"),
         ]
     )
 
@@ -201,8 +211,8 @@ def test_outlines_adapter():
             metrics["recall"] >= min_threshold
         ), f"{sampler_type} recall {metrics['recall']} below threshold {min_threshold}"
         assert (
-            metrics["f1"] >= min_threshold
-        ), f"{sampler_type} F1 score {metrics['f1']} below threshold {min_threshold}"
+            metrics["f_measure"] >= min_threshold
+        ), f"{sampler_type} F-measure {metrics['f_measure']} below threshold {min_threshold}"
 
         # Log the metrics for visibility
         logger.info(f"{sampler_type} alignment metrics: {metrics}")

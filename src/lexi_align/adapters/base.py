@@ -1,7 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import List, Optional
-from lexi_align.models import TextAlignment
 from logging import getLogger
+from typing import TYPE_CHECKING, List, Optional
+
+if TYPE_CHECKING:
+    from lexi_align.models import TextAlignment
 
 logger = getLogger(__name__)
 
@@ -10,11 +12,11 @@ class LLMAdapter(ABC):
     """Base class for LLM adapters."""
 
     @abstractmethod
-    def __call__(self, messages: list[dict]) -> TextAlignment:
+    def __call__(self, messages: list[dict]) -> "TextAlignment":
         """Synchronous call to generate alignments."""
         pass
 
-    async def acall(self, messages: list[dict]) -> TextAlignment:
+    async def acall(self, messages: list[dict]) -> "TextAlignment":
         """
         Async call to generate alignments.
         Default implementation calls sync version - override for true async support.
@@ -28,11 +30,18 @@ class LLMAdapter(ABC):
         """
         return False
 
+    def supports_length_constraints(self) -> bool:
+        """
+        Check if the adapter supports alignment length constraints.
+        Override this method to return True in adapters that support min/max alignment lengths.
+        """
+        return False
+
     def batch(
         self,
         batch_messages: List[List[dict]],
         max_retries: int = 3,
-    ) -> List[Optional[TextAlignment]]:
+    ) -> List[Optional["TextAlignment"]]:
         """
         Process multiple message sequences in batch.
         Default implementation processes sequences sequentially - override for true batch support.
@@ -47,7 +56,7 @@ class LLMAdapter(ABC):
         logger.warning(
             f"{self.__class__.__name__} does not support true batching - falling back to sequential processing"
         )
-        results: List[Optional[TextAlignment]] = []
+        results: List[Optional["TextAlignment"]] = []
         for messages in batch_messages:
             try:
                 result = self(messages)

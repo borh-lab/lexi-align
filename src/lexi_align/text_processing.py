@@ -1,6 +1,6 @@
 import re
-from typing import Callable, Pattern
 from dataclasses import dataclass
+from typing import Callable, Pattern
 
 
 @dataclass

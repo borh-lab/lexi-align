@@ -1,13 +1,15 @@
 import os
+from logging import getLogger
+
 import pytest
+
 from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
 from lexi_align.core import (
     align_tokens,
     align_tokens_async,
 )
-from lexi_align.models import TextAlignment, TokenAlignment, AlignmentResult
 from lexi_align.metrics import calculate_metrics
-from logging import getLogger
+from lexi_align.models import AlignmentResult, TextAlignment, TokenAlignment
 
 logger = getLogger(__name__)
 
@@ -27,8 +29,8 @@ def test_litellm_adapter():
             "Le chat".split(),
             TextAlignment(
                 alignment=[
-                    TokenAlignment(source_token="The", target_token="Le"),
-                    TokenAlignment(source_token="cat", target_token="chat"),
+                    TokenAlignment(source="The", target="Le"),
+                    TokenAlignment(source="cat", target="chat"),
                 ]
             ),
         )
@@ -43,10 +45,10 @@ def test_litellm_adapter():
     # Update expected to match the actual source/target tokens
     expected = TextAlignment(
         alignment=[
-            TokenAlignment(source_token="I", target_token="Je"),
-            TokenAlignment(source_token="see", target_token="vois"),
-            TokenAlignment(source_token="a", target_token="un"),
-            TokenAlignment(source_token="dog", target_token="chien"),
+            TokenAlignment(source="I", target="Je"),
+            TokenAlignment(source="see", target="vois"),
+            TokenAlignment(source="a", target="un"),
+            TokenAlignment(source="dog", target="chien"),
         ]
     )
 
@@ -76,8 +78,8 @@ def test_litellm_adapter():
         metrics["recall"] >= min_threshold
     ), f"Recall {metrics['recall']} below threshold {min_threshold}"
     assert (
-        metrics["f1"] >= min_threshold
-    ), f"F1 score {metrics['f1']} below threshold {min_threshold}"
+        metrics["f_measure"] >= min_threshold
+    ), f"F-measure {metrics['f_measure']} below threshold {min_threshold}"
 
     # Log the metrics for visibility
     logger.info(f"Alignment metrics: {metrics}")
@@ -99,8 +101,8 @@ async def test_litellm_adapter_async():
             "Le chat".split(),
             TextAlignment(
                 alignment=[
-                    TokenAlignment(source_token="The", target_token="Le"),
-                    TokenAlignment(source_token="cat", target_token="chat"),
+                    TokenAlignment(source="The", target="Le"),
+                    TokenAlignment(source="cat", target="chat"),
                 ]
             ),
         )
@@ -115,10 +117,10 @@ async def test_litellm_adapter_async():
     # Update expected to match the actual source/target tokens
     expected = TextAlignment(
         alignment=[
-            TokenAlignment(source_token="I", target_token="Je"),
-            TokenAlignment(source_token="see", target_token="vois"),
-            TokenAlignment(source_token="a", target_token="un"),
-            TokenAlignment(source_token="dog", target_token="chien"),
+            TokenAlignment(source="I", target="Je"),
+            TokenAlignment(source="see", target="vois"),
+            TokenAlignment(source="a", target="un"),
+            TokenAlignment(source="dog", target="chien"),
         ]
     )
 
@@ -147,8 +149,8 @@ async def test_litellm_adapter_async():
         metrics["recall"] >= min_threshold
     ), f"Recall {metrics['recall']} below threshold {min_threshold}"
     assert (
-        metrics["f1"] >= min_threshold
-    ), f"F1 score {metrics['f1']} below threshold {min_threshold}"
+        metrics["f_measure"] >= min_threshold
+    ), f"F-measure {metrics['f_measure']} below threshold {min_threshold}"
 
     # Log the metrics for visibility
     logger.info(f"Alignment metrics: {metrics}")

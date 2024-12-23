@@ -1,12 +1,13 @@
+from logging import getLogger
 from typing import Dict, Optional
+
 import matplotlib.pyplot as plt
 import seaborn as sns  # type: ignore
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
-from logging import getLogger
+
 from lexi_align.models import TextAlignment
-from lexi_align.utils import make_unique
-from lexi_align.metrics import calculate_metrics
+from lexi_align.utils import create_token_mapping, make_unique
 
 logger = getLogger(__name__)
 
@@ -38,17 +39,26 @@ def visualize_alignments(
         >>> target = "Le chat assis".split()
         >>> alignments = {
         ...     "model1": TextAlignment(alignment=[
-        ...         TokenAlignment(source_token="The", target_token="Le"),
-        ...         TokenAlignment(source_token="cat", target_token="chat")
+        ...         TokenAlignment(source="The", target="Le"),
+        ...         TokenAlignment(source="cat", target="chat")
         ...     ]),
         ...     "model2": TextAlignment(alignment=[
-        ...         TokenAlignment(source_token="The", target_token="Le"),
-        ...         TokenAlignment(source_token="cat", target_token="chat"),
-        ...         TokenAlignment(source_token="sat", target_token="assis")
+        ...         TokenAlignment(source="The", target="Le"),
+        ...         TokenAlignment(source="cat", target="chat"),
+        ...         TokenAlignment(source="sat", target="assis")
         ...     ])
         ... }
         >>> visualize_alignments(source, target, alignments, "Test Alignment")  # doctest: +SKIP
     """
+
+    # Create token mappings once for reuse
+    source_mapping = create_token_mapping(source_tokens)
+    target_mapping = create_token_mapping(target_tokens)
+
+    # Use uniquified tokens from mappings
+    source_tokens = source_mapping.uniquified
+    target_tokens = target_mapping.uniquified
+
     # Filter out empty alignments
     alignments = {k: v for k, v in alignments.items() if v.alignment}
 
@@ -89,7 +99,7 @@ def visualize_alignments(
     model_names = sorted(name for name in alignments.keys() if name != reference_model)
     colors = sns.color_palette("Pastel1", n_colors=len(model_names))
 
-    # Create mapping of positions for each alignment
+    # Create mapping of positions for each alignment using TextAlignment methods
     cell_models: Dict[tuple[int, int], set[str]] = {
         (i, j): set()
         for i in range(len(source_tokens))
@@ -99,13 +109,11 @@ def visualize_alignments(
     # Collect which models align each cell (excluding reference model)
     for model, alignment in alignments.items():
         if model != reference_model:  # Skip reference model
-            for align in alignment.alignment:
-                try:
-                    s_idx = source_tokens.index(align.source_token)
-                    t_idx = target_tokens.index(align.target_token)
-                    cell_models[(s_idx, t_idx)].add(model)
-                except ValueError as e:
-                    logger.warning(f"Token alignment error in {model}: {e}")
+            # Get position-based alignments
+            for s_idx, t_idx in alignment.get_alignment_positions(
+                source_mapping, target_mapping
+            ):
+                cell_models[(s_idx, t_idx)].add(model)
 
     # Draw the alignments
     for i, _source_token in enumerate(source_tokens):
@@ -114,13 +122,14 @@ def visualize_alignments(
             if models_for_cell:
                 # Draw reference model highlighting if specified
                 if reference_model:
-                    # Check if this cell is in the reference model's alignment
+                    # Check if this cell is in the reference alignment using positions
                     ref_alignment = alignments[reference_model]
-                    is_in_reference = any(
-                        align.source_token == source_tokens[i]
-                        and align.target_token == target_tokens[j]
-                        for align in ref_alignment.alignment
+                    ref_positions = set(
+                        ref_alignment.get_alignment_positions(
+                            source_mapping, target_mapping
+                        )
                     )
+                    is_in_reference = (i, j) in ref_positions
                     color = "black" if is_in_reference else "red"
                     ax.add_patch(
                         Rectangle(
@@ -244,7 +253,9 @@ def visualize_alignments(
     if reference_model:
         metrics_text = "Metrics vs Reference:\n"
         for model in model_names:
-            metrics = calculate_metrics(alignments[model], alignments[reference_model])
+            metrics = alignments[model].compare_alignments(
+                alignments[reference_model], source_mapping, target_mapping
+            )
             metrics_text += f"{model}: P={metrics['precision']:.2f} R={metrics['recall']:.2f} F1={metrics['f1']:.2f}\n"
 
         # Add metrics text above legend, right-aligned and closer to left side

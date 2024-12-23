@@ -1,7 +1,7 @@
 from lexi_align.utils import (
+    AssistantMessage,
     SystemMessage,
     UserMessage,
-    AssistantMessage,
     format_messages,
 )
 

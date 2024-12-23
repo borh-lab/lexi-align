@@ -144,6 +144,8 @@ for result in results:
 
 ### Async Processing
 
+**EXPERIMENTAL**
+
 For asynchronous processing:
 
 ```python
@@ -201,6 +203,9 @@ for attempt in result.attempts:
     if attempt.exception:
         print("Exception:", attempt.exception)
 ```
+
+Note that `AlignmentResult` is returned even if the alignment failed (due to external or internal factors).
+Use the above code as a guide to examine the errors.
 
 ### Using Custom Guidelines and Examples
 
@@ -303,30 +308,53 @@ unique_tokens = make_unique(tokens, marker_gen)
 print(unique_tokens)  # ['the_1', 'cat', 'the_2', 'mat']
 ```
 
-### Using Local Models with Outlines
+### Dynamic Schema Generation
 
-For running local models, you can use the Outlines adapter:
+The library now uses dynamic schema generation by default to improve alignment quality and validation:
 
 ```python
 from lexi_align.adapters.outlines_adapter import OutlinesAdapter
 from lexi_align.core import align_tokens
 
-# Initialize the Outlines adapter with a local model
+# Initialize adapter - supports dynamic schema by default
 llm_adapter = OutlinesAdapter(
-    model_name="Qwen/Qwen2.5-1.5B-Instruct",  # or any local model path
-    dtype="bfloat16",  # optional: choose quantization
-    device="cuda"      # optional: specify device
+    model_name="Qwen/Qwen2.5-1.5B-Instruct",
+    dtype="bfloat16",
+    device="cuda",
+    batch_size=5  # Enable efficient batching
 )
 
-# Use the same API as with other adapters
-alignment = align_tokens(
+# The library automatically:
+# 1. Generates a schema specific to your token sets
+# 2. Validates token existence and uniqueness
+# 3. Enforces alignment length constraints
+# 4. Provides detailed error messages for invalid alignments
+
+result = align_tokens(
     llm_adapter,
     source_tokens,
     target_tokens,
     source_language="English",
     target_language="French"
 )
+
+# Check validation results
+if result.alignment:
+    print("Valid alignment achieved")
+else:
+    for attempt in result.attempts:
+        if attempt.validation_errors:
+            print(f"Attempt {attempt.attempt_number} errors:")
+            for error_type, msg, tokens in attempt.validation_errors:
+                print(f"- {error_type}: {msg}")
 ```
+
+The dynamic schema:
+- Ensures tokens exist in the source/target sets
+- Handles repeated tokens with unique markers
+- Sets minimum/maximum alignment lengths
+- Provides clear error messages for invalid alignments
+- Supports partial alignments with retries
 
 ### Using Local Models with llama.cpp
 
