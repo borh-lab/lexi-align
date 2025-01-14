@@ -312,7 +312,7 @@ def _create_retry_message(
             {"source": align.source, "target": align.target}
             for align in valid_alignments
         ]
-        alignment_str = json.dumps({"alignment": alignment_dicts})
+        alignment_str = json.dumps({"alignment": alignment_dicts}, ensure_ascii=False)
         message_parts.append("Here are partial alignments:")
         message_parts.append(alignment_str)
         message_parts.append("")
