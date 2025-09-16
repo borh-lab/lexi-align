@@ -20,7 +20,7 @@ jobs:
         with:
           version: "latest"
       - name: Install dependencies
-        run: uv sync --extra dev -p 3.12
+        run: uv sync --dev -p 3.12
       - name: Mypy
         # We disable this error in order to not have to install all deps for now
         run: uv run mypy --ignore-missing-imports src tests evaluations
