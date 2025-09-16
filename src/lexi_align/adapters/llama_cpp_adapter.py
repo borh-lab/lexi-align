@@ -142,7 +142,9 @@ class LlamaCppAdapter(LLMAdapter):
                 )
         return self._model
 
-    def format_messages(self, messages: list["ChatMessageDict"]) -> str:
+    def format_messages(
+        self, messages: list["ChatMessageDict"] | list[dict[str, str]]
+    ) -> str:
         """Format chat messages into a prompt string."""
         formatted = []
         for msg in messages:

@@ -9,7 +9,6 @@ from typing import (
     List,
     Literal,
     Optional,
-    Sequence,
     Type,
     TypedDict,
     Union,
@@ -626,9 +625,9 @@ def create_dynamic_alignment_schema(
         model_config = ConfigDict(extra="forbid")
         # model_config = ConfigDict(arbitrary_types_allowed=True)
         if TYPE_CHECKING:
-            alignment: Sequence[TokenAlignment]
+            alignment: list[TokenAlignment]
         else:
-            alignment: Sequence[DynamicTokenAlignment] = Field(
+            alignment: list[DynamicTokenAlignment] = Field(
                 min_length=min_length,
                 max_length=max_length,
             )
@@ -650,12 +649,11 @@ def create_dynamic_alignment_schema(
             cls, base: TextAlignmentSchema
         ) -> "DynamicTextAlignmentSchema":
             """Convert base schema to dynamic schema."""
-            # Convert TokenAlignment objects to DynamicTokenAlignment
-            dynamic_alignments = [
-                DynamicTokenAlignment(source=a.source, target=a.target)
-                for a in base.alignment
+            # Convert TokenAlignment objects to TokenAlignment to satisfy typing
+            alignments_list: list[TokenAlignment] = [
+                TokenAlignment(source=a.source, target=a.target) for a in base.alignment
             ]
-            return cls(alignment=dynamic_alignments)
+            return cls(alignment=alignments_list)
 
         def to_base_schema(self) -> TextAlignmentSchema:
             """Convert dynamic schema to base schema."""

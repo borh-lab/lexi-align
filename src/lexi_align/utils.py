@@ -30,12 +30,18 @@ DEFAULT_SUBSCRIPT = create_subscript_generator()
 
 
 class SystemMessage:
+    role: Literal["system"]
+    content: str
+
     def __init__(self, content: str):
         self.role = "system"
         self.content = content
 
 
 class UserMessage:
+    role: Literal["user"]
+    content: Union[str, BaseModel]
+
     def __init__(self, content: Union[str, BaseModel]):
         self.role = "user"
         if isinstance(content, BaseModel):  # Compact output to save on tokens
@@ -45,6 +51,9 @@ class UserMessage:
 
 
 class AssistantMessage:
+    role: Literal["assistant"]
+    content: Union[str, BaseModel]
+
     def __init__(self, content: Union[str, BaseModel]):
         self.role = "assistant"
         if isinstance(content, BaseModel):  # Compact output to save on tokens
@@ -108,7 +117,8 @@ def format_messages(*messages: Any) -> list[ChatMessageDict]:
             content = msg.content
             if isinstance(content, BaseModel):
                 content = content.model_dump_json(indent=None)
-            out.append({"role": msg.role, "content": content})
+            role_lit = cast(Literal["system", "user", "assistant"], msg.role)
+            out.append({"role": role_lit, "content": content})
         elif isinstance(msg, dict):
             role_val = msg.get("role", "user")
             if role_val not in ("system", "user", "assistant"):

@@ -1,5 +1,15 @@
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Type, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Type,
+    cast,
+)
 
 if TYPE_CHECKING:
     from lexi_align.models import ChatMessageDict
@@ -88,7 +98,7 @@ class OutlinesAdapter(LLMAdapter):
         self.min_p: Optional[float] = min_p
 
         # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.tokenizer: Any = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=True
         )
 
@@ -125,7 +135,7 @@ class OutlinesAdapter(LLMAdapter):
             load_kwargs.setdefault("device_map", "auto")
             load_kwargs.setdefault("low_cpu_mem_usage", True)
 
-        hf_model = AutoModelForCausalLM.from_pretrained(
+        hf_model: Any = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             config=config,
             trust_remote_code=True,
@@ -135,7 +145,8 @@ class OutlinesAdapter(LLMAdapter):
         if self.device == "cuda" and "device_map" not in load_kwargs:
             hf_model = hf_model.to("cuda")
 
-        return cast(Any, from_transformers)(cast(Any, hf_model), self.tokenizer)
+        builder: Callable[[Any, Any], Any] = cast(Any, from_transformers)
+        return builder(cast(Any, hf_model), cast(Any, self.tokenizer))  # type: ignore[arg-type]
 
     @property
     def model(self):
