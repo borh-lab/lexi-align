@@ -14,62 +14,45 @@ dependencies = [
 [project.optional-dependencies]
 litellm = ["litellm>=1.51.0"]
 outlines = [
-    "outlines>=0.1.9",
+    "outlines>=1.0.1",
     "datasets>=3.2.0",
     "transformers>=4.46.1",
     "accelerate>=1.0.1",
-    "torch>=2.5.1",
-    # # If using ROCm:
-    "torch==2.5.1+rocm6.2",
-    "pytorch-triton-rocm==3.1.0",
     # Needed by some models:
     "protobuf>=5.29.1",
     "sentencepiece>=0.2.0",
+    "numba>=0.61.2",
 ]
-llama-cpp = ["llama-cpp-python>=0.3.1"]
+llama-cpp = ["llama-cpp-python>=0.3.6"]
 viz = [
     "matplotlib>=3.9.2",
     "seaborn>=0.13.2",
+    "altair>=5.5.0",
+    "polars>=1.29.0",
+]
+cpu = [
+    "torch>=2.8.0",
+]
+cuda = [
+    "torch>=2.8.0",
+    "flash-attn",
+    "bitsandbytes",
+]
+rocm = [
+    "torch==2.8.0+rocm6.4",
+    "pytorch_triton_rocm==3.4.0",
 ]
 
-# The following is for different accelerators:
-[tool.uv.sources]
-torch = { index = "pytorch-rocm" }
-# We leave this here because it does not interfere with other packages:
-pytorch-triton-rocm = { index = "pytorch-rocm" }
-# If wanting the development version:
-# outlines = { git = "https://github.com/dottxt-ai/outlines.git" }
-# If wanting to use CUDA wheels:
-# llama-cpp-python = { index = "llama-cpp-python-cuda" }
-
-[[tool.uv.index]]
-name = "pytorch-rocm"
-url = "https://download.pytorch.org/whl/rocm6.2"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cuda"
-url = "https://download.pytorch.org/whl/cu124"
-explicit = true
-
-[[tool.uv.index]]
-name = "llama-cpp-python-cuda"
-url = "https://abetlen.github.io/llama-cpp-python/whl/cu125"
-explicit = true
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [dependency-groups]
-dev = [
-    # All extra dependencies for ci and convenience
+dev-deps = [
+    # All extra dependencies for ci and convenience.
+    # Note that this will use the normal torch (CUDA on linux).
     "litellm>=1.51.0",
     "boto3>=1.35.50",
     "llama-cpp-python>=0.3.1",
     "outlines>=0.1.1",
     "transformers>=4.46.1",
-    "torch>=2.5.1",
+    # "torch>=2.5.1",
     "accelerate>=1.0.1",
     # Eval
     "requests>=2.31.0",
@@ -87,7 +70,58 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "loguru>=0.7.2",
     "scipy>=1.14.1",
+    # Notebook
+    "marimo[lsp]>=0.13.0"
 ]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cuda" },
+        { extra = "rocm" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "platform_system != 'Darwin'" },
+    # { index = "pytorch-cuda", extra = "cuda" },
+    { index = "pytorch-rocm", extra = "rocm" },
+]
+pytorch-triton-rocm = [
+    { index = "pytorch-rocm", extra = "rocm" },
+]
+# flash-attn = { url = "https://github.com/Zarrac/my-pytorch-builds/releases/download/flash-attn-2.7.4.post1-cuda12.8/flash_attn-2.7.4.post1+pt270cu128cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+# If wanting the development version:
+# outlines = { git = "https://github.com/dottxt-ai/outlines.git" }
+# If wanting to use CUDA wheels:
+# llama-cpp-python = { index = "llama-cpp-python-cuda", extra = "cuda" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.4"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "llama-cpp-python-cuda"
+url = "https://abetlen.github.io/llama-cpp-python/whl/cu125"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 minversion = "6.0"
@@ -99,3 +133,6 @@ testpaths = [
 ]
 doctest_optionflags = "NORMALIZE_WHITESPACE IGNORE_EXCEPTION_DETAIL"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.marimo.experimental]
+lsp = true

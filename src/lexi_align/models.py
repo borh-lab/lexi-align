@@ -3,17 +3,31 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from logging import getLogger
-from typing import Dict, List, Optional, Sequence, Type, Union
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Type,
+    TypedDict,
+    Union,
+)
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Self
 
-from lexi_align.adapters.base import LLMAdapter
+if TYPE_CHECKING:
+    from lexi_align.adapters.base import LLMAdapter
+
 from lexi_align.text_processing import (
     MarkerGenerator,
     create_subscript_generator,
     remove_unique_one,
 )
+
+logger = getLogger(__name__)
 
 
 def calculate_max_alignments(source_tokens: List[str], target_tokens: List[str]) -> int:
@@ -43,6 +57,18 @@ class SpecialTokens(str, Enum):
     TARGET_SPECIFIC = "<target_specific>"
 
 
+UNALIGNED_MARKER = SpecialTokens.UNALIGNED.value
+
+
+def _create_token_enum(name: str, tokens: list[str]) -> Type[Enum]:
+    """Helper to generate a Token Enum with UNALIGNED and the given tokens."""
+    values = {"UNALIGNED": SpecialTokens.UNALIGNED.value}
+    values.update(
+        {token.replace(" ", "_").replace("-", "_").upper(): token for token in tokens}
+    )
+    return Enum(f"{name}Tokens", values)  # type: ignore
+
+
 def create_source_token_enum(tokens: list[str]) -> Type[Enum]:
     """Create an Enum class for source tokens including special markers.
 
@@ -60,20 +86,7 @@ def create_source_token_enum(tokens: list[str]) -> Type[Enum]:
          <SourceTokens.CAT: 'cat'>,
          <SourceTokens.THE₂: 'the₂'>]
     """
-    # Create enum values dict with special tokens
-    values = {
-        "UNALIGNED": SpecialTokens.UNALIGNED.value,
-        # "SOURCE_SPECIFIC": SpecialTokens.SOURCE_SPECIFIC.value,
-    }
-
-    # Add tokens, converting to valid enum names
-    for token in tokens:
-        # Create valid Python identifier from token
-        enum_name = token.replace(" ", "_").replace("-", "_").upper()
-        values[enum_name] = token
-
-    # Create and return the Enum type
-    return Enum("SourceTokens", values)  # type: ignore
+    return _create_token_enum("Source", tokens)
 
 
 def create_target_token_enum(tokens: list[str]) -> Type[Enum]:
@@ -85,23 +98,7 @@ def create_target_token_enum(tokens: list[str]) -> Type[Enum]:
     Returns:
         Enum class containing tokens and special markers
     """
-    values = {
-        "UNALIGNED": SpecialTokens.UNALIGNED.value,
-        # "TARGET_SPECIFIC": SpecialTokens.TARGET_SPECIFIC.value,
-    }
-
-    # Add tokens
-    for token in tokens:
-        enum_name = token.replace(" ", "_").replace("-", "_").upper()
-        values[enum_name] = token
-
-    # Create and return the Enum type
-    return Enum("TargetTokens", values)  # type: ignore
-
-
-logger = getLogger(__name__)
-
-UNALIGNED_MARKER = "<unaligned>"
+    return _create_token_enum("Target", tokens)
 
 
 class ValidationErrorType(str, Enum):
@@ -119,6 +116,17 @@ class ValidationErrorType(str, Enum):
         "DUPLICATE_ALIGNMENT"  # For tokens aligned multiple times when not allowed
     )
     OTHER = "OTHER"  # For unexpected errors
+
+
+class ValidationErrorDict(TypedDict):
+    type: ValidationErrorType
+    message: str
+    tokens: List[str]
+
+
+class ChatMessageDict(TypedDict):
+    role: Literal["system", "user", "assistant"]
+    content: str
 
 
 def make_unique(
@@ -255,27 +263,15 @@ class TokenMapping:
 
     def get_position(self, token: str, normalized: bool = True) -> int:
         """Get position of a token, optionally normalizing it first."""
-
-        if normalized:
-            # If it's already a uniquified token, look it up directly
-            if token in self.unique_positions:
-                return self.unique_positions[token]
-
-            # Otherwise get the base token and find which uniquified version matches
-            normalized_token = remove_unique_one(token, self.marker_pattern)
-            if normalized_token not in self.positions:
-                return -1
-
-            # Find which occurrence this uniquified token represents
-            if token in self.uniquified:
-                idx = self.uniquified.index(token)
-                pos_list = self.positions[normalized_token]
-                if idx < len(pos_list):
-                    return pos_list[idx]
-            # If not found as uniquified, return first position (backward compatibility)
-            return self.positions[normalized_token][0]
-
-        return self.unique_positions.get(token, -1)
+        if not normalized:
+            return self.unique_positions.get(token, -1)
+        # If it's already a uniquified token, look it up directly
+        if token in self.unique_positions:
+            return self.unique_positions[token]
+        # Otherwise normalize and return the first occurrence position (if any)
+        base = remove_unique_one(token, self.marker_pattern)
+        pos_list = self.positions.get(base)
+        return pos_list[0] if pos_list else -1
 
     def get_uniquified(self, token: str) -> str:
         """Get uniquified version of a normalized token."""
@@ -304,6 +300,7 @@ class TokenAlignment(BaseModel):
 
 
 class TextAlignmentSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     alignment: List[TokenAlignment] = Field(
         description="A list of (source_token, target_token) TokenAlignment objects representing the alignment between tokens in the source and target texts. The provided tokens are space-delimited strings and should not be further split. A token can be aligned to multiple tokens; in such cases, include multiple tuples with the same source_token paired with different target_tokens. Unaligned tokens (typically those with predominantly grammatical function) can be omitted from the alignment list. For disambiguation, if a token appears multiple times, a suffix is appended to it; reuse this suffix to ensure correct alignment."
     )
@@ -379,7 +376,6 @@ class TextAlignment(TextAlignmentSchema):
         if not alignments:
             return alignments
 
-        # Add debug logging
         # logger.debug("Sorting alignments:")
         for align in alignments:
             s_pos = source_mapping.get_position(align.source)
@@ -412,7 +408,7 @@ class TextAlignment(TextAlignmentSchema):
         source_tokens: list[str],
         target_tokens: list[str],
         marker_generator: Optional[MarkerGenerator] = None,
-        adapter: Optional[LLMAdapter] = None,
+        adapter: Optional["LLMAdapter"] = None,
     ) -> "TextAlignment":
         """Create a TextAlignment from a list of TokenAlignment objects and token lists."""
         # Create mappings with optional marker generator
@@ -456,12 +452,24 @@ class TextAlignment(TextAlignmentSchema):
         target_mapping: TokenMapping,
     ) -> "TextAlignment":
         """Sort alignments by source position first, then target position."""
-        # sorted_alignments = self.sort_alignments(
-        #     self.alignment, source_mapping, target_mapping
-        # )
-        # logger.debug("Sorting alignments in sort_by_position")
+        special_vals = {
+            SpecialTokens.UNALIGNED.value,
+            SpecialTokens.SOURCE_SPECIFIC.value,
+            SpecialTokens.TARGET_SPECIFIC.value,
+        }
+        regular = [
+            a
+            for a in self.alignment
+            if a.source not in special_vals and a.target not in special_vals
+        ]
+        special = [
+            a
+            for a in self.alignment
+            if a.source in special_vals or a.target in special_vals
+        ]
+        sorted_regular = self.sort_alignments(regular, source_mapping, target_mapping)
         return TextAlignment(
-            alignment=self.alignment,
+            alignment=sorted_regular + special,
             source_mapping=source_mapping,
             target_mapping=target_mapping,
         )
@@ -484,37 +492,33 @@ class TextAlignment(TextAlignmentSchema):
 
         return self_pairs == other_pairs
 
+    def pairs(self) -> list[tuple[str, str]]:
+        """Return [(source, target), ...] pairs for convenience.
+        Example:
+            >>> ta = TextAlignment(alignment=[TokenAlignment(source="a", target="b")])
+            >>> ta.pairs()
+            [('a', 'b')]
+        """
+        return [(a.source, a.target) for a in self.alignment]
+
     def get_alignment_positions(
         self,
-        source_mapping: TokenMapping,
-        target_mapping: TokenMapping,
+        source_mapping: Optional[TokenMapping] = None,
+        target_mapping: Optional[TokenMapping] = None,
     ) -> list[tuple[int, int]]:
-        """Get alignment positions using token mappings.
+        """Get alignment positions using token mappings. If mappings are not
+        provided, defaults to the mappings stored on this instance."""
 
-        Args:
-            source_mapping: TokenMapping for source tokens
-            target_mapping: TokenMapping for target tokens
-
-        Returns:
-            List of (source_pos, target_pos) tuples
-
-        Example:
-            >>> from lexi_align.utils import create_token_mapping
-            >>> source = ["the", "cat", "the"]
-            >>> target = ["le", "chat", "le"]
-            >>> alignments = [
-            ...     TokenAlignment(source="the₁", target="le₁"),
-            ...     TokenAlignment(source="cat",  target="chat"),
-            ...     TokenAlignment(source="the₂", target="le₂")
-            ... ]
-            >>> align = TextAlignment.from_token_alignments(alignments, source, target)
-            >>> align.get_alignment_positions(align.source_mapping, align.target_mapping)
-            [(0, 0), (1, 1), (2, 2)]
-        """
-        positions = []
+        sm = source_mapping or self.source_mapping
+        tm = target_mapping or self.target_mapping
+        if sm is None or tm is None:
+            raise ValueError(
+                "Token mappings are required (provide arguments or ensure TextAlignment has source_mapping/target_mapping)."
+            )
+        positions: list[tuple[int, int]] = []
         for align in self.alignment:
-            s_pos = source_mapping.get_position(align.source_token)
-            t_pos = target_mapping.get_position(align.target_token)
+            s_pos = sm.get_position(align.source_token)
+            t_pos = tm.get_position(align.target_token)
             if s_pos >= 0 and t_pos >= 0:
                 positions.append((s_pos, t_pos))
         return sorted(positions)
@@ -590,16 +594,12 @@ def create_dynamic_alignment_schema(
     unique_target = make_unique(target_tokens, marker_generator)
 
     # Create enums directly from the tokens plus special tokens
-    source_enum = create_source_token_enum(
-        unique_source
-    )  # Special tokens added in enum creation
-    target_enum = create_target_token_enum(
-        unique_target
-    )  # Special tokens added in enum creation
+    source_enum = create_source_token_enum(unique_source)
+    target_enum = create_target_token_enum(unique_target)
 
     # Calculate alignment constraints using original token counts if not provided
     if min_length is None:
-        min_length = min(len(source_tokens), len(target_tokens))
+        min_length = 0
     if max_length is None:
         max_length = calculate_max_alignments(source_tokens, target_tokens)
 
@@ -607,19 +607,43 @@ def create_dynamic_alignment_schema(
     class DynamicTokenAlignment(TokenAlignment):
         """Dynamic token alignment with enum-based validation."""
 
-        model_config = ConfigDict(use_enum_values=True)
+        model_config = ConfigDict(use_enum_values=True, extra="forbid")
         source: source_enum  # type: ignore
         target: target_enum  # type: ignore
+
+        @model_validator(mode="after")
+        def _no_both_unaligned(self) -> "DynamicTokenAlignment":
+            if self.source == UNALIGNED_MARKER and self.target == UNALIGNED_MARKER:
+                raise ValueError(
+                    "Both source and target cannot be <unaligned> in one pair"
+                )
+            return self
 
     # Create the schema class with the dynamic token alignment
     class DynamicTextAlignmentSchema(TextAlignmentSchema):
         """Dynamic text alignment schema with enum-based validation."""
 
+        model_config = ConfigDict(extra="forbid")
         # model_config = ConfigDict(arbitrary_types_allowed=True)
-        alignment: Sequence[DynamicTokenAlignment] = Field(
-            min_length=min_length,
-            max_length=max_length,
-        )
+        if TYPE_CHECKING:
+            alignment: Sequence[TokenAlignment]
+        else:
+            alignment: Sequence[DynamicTokenAlignment] = Field(
+                min_length=min_length,
+                max_length=max_length,
+            )
+
+        @model_validator(mode="after")
+        def _check_unique_pairs(self) -> "DynamicTextAlignmentSchema":
+            seen: set[tuple[str, str]] = set()
+            for a in self.alignment:
+                pair = (a.source, a.target)
+                if pair in seen:
+                    raise ValueError(
+                        f"Duplicate alignment pairs are not allowed: {pair}"
+                    )
+                seen.add(pair)
+            return self
 
         @classmethod
         def from_base_schema(
@@ -655,11 +679,26 @@ class AlignmentAttempt(BaseModel):
     """Records details of a single alignment attempt"""
 
     attempt_number: int
-    messages_sent: list[dict]
+    messages_sent: list[ChatMessageDict]
     raw_response: Optional[TextAlignment]
     validation_passed: bool
     validation_errors: list[tuple[ValidationErrorType, str, list[str]]]
     exception: Optional[str] = None
+
+    @property
+    def validation_errors_typed(self) -> List["ValidationErrorDict"]:
+        """
+        Return validation errors as typed dictionaries.
+        Example:
+            >>> from lexi_align.models import AlignmentAttempt, ValidationErrorType
+            >>> a = AlignmentAttempt(attempt_number=1, messages_sent=[], raw_response=None, validation_passed=False, validation_errors=[(ValidationErrorType.OTHER, "oops", ["x"])])
+            >>> a.validation_errors_typed[0]["message"]
+            'oops'
+        """
+        return [
+            {"type": et, "message": msg, "tokens": toks}
+            for et, msg, toks in self.validation_errors
+        ]
 
 
 class AlignmentResult(BaseModel):

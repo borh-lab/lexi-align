@@ -16,12 +16,12 @@ def validate_alignment_tokens(
     """Helper function to validate alignment tokens."""
     src_aligned = {align.source_token for align in alignment.alignment}
     tgt_aligned = {align.target_token for align in alignment.alignment}
-    assert src_aligned.issubset(
-        set(src_tokens)
-    ), f"Aligned source tokens {src_aligned} not subset of input tokens {set(src_tokens)}"
-    assert tgt_aligned.issubset(
-        set(tgt_tokens)
-    ), f"Aligned target tokens {tgt_aligned} not subset of input tokens {set(tgt_tokens)}"
+    assert src_aligned.issubset(set(src_tokens)), (
+        f"Aligned source tokens {src_aligned} not subset of input tokens {set(src_tokens)}"
+    )
+    assert tgt_aligned.issubset(set(tgt_tokens)), (
+        f"Aligned target tokens {tgt_aligned} not subset of input tokens {set(tgt_tokens)}"
+    )
 
 
 @pytest.mark.llm
@@ -204,15 +204,15 @@ def test_outlines_adapter():
 
         # Check if metrics meet minimum thresholds
         min_threshold = 0.25
-        assert (
-            metrics["precision"] >= min_threshold
-        ), f"{sampler_type} precision {metrics['precision']} below threshold {min_threshold}"
-        assert (
-            metrics["recall"] >= min_threshold
-        ), f"{sampler_type} recall {metrics['recall']} below threshold {min_threshold}"
-        assert (
-            metrics["f_measure"] >= min_threshold
-        ), f"{sampler_type} F-measure {metrics['f_measure']} below threshold {min_threshold}"
+        assert metrics["precision"] >= min_threshold, (
+            f"{sampler_type} precision {metrics['precision']} below threshold {min_threshold}"
+        )
+        assert metrics["recall"] >= min_threshold, (
+            f"{sampler_type} recall {metrics['recall']} below threshold {min_threshold}"
+        )
+        assert metrics["f_measure"] >= min_threshold, (
+            f"{sampler_type} F-measure {metrics['f_measure']} below threshold {min_threshold}"
+        )
 
         # Log the metrics for visibility
         logger.info(f"{sampler_type} alignment metrics: {metrics}")

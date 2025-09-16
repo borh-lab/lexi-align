@@ -1,9 +1,21 @@
+from typing import TypedDict
+
 from lexi_align.models import TextAlignment
+
+
+class Metrics(TypedDict):
+    precision: float
+    recall: float
+    f_measure: float
+    aer: float
+    true_positives: int
+    predicted: int
+    gold: int
 
 
 def calculate_metrics(
     predicted: TextAlignment, gold: TextAlignment, f_alpha: float = 0.5
-) -> dict:
+) -> Metrics:
     """Calculate alignment metrics following standard word alignment evaluation.
 
     Args:

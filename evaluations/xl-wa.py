@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
 import json
 import logging
 import math
 import random
 import sys
 import tempfile
-from collections import defaultdict
+import time
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, DefaultDict, Dict, List, Optional, Tuple, TypedDict, Union, cast
+from types import FrameType
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union, cast
 from zipfile import ZipFile
 
 import matplotlib.pyplot as plt
@@ -16,6 +19,163 @@ import pandas as pd  # type: ignore
 import requests  # type: ignore
 import seaborn as sns  # type: ignore
 from loguru import logger
+from matplotlib.backends.backend_pdf import PdfPages
+from scipy.stats import binomtest  # type: ignore
+from tqdm import tqdm  # type: ignore
+
+from lexi_align.adapters import create_adapter
+from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
+from lexi_align.adapters.llama_cpp_adapter import LlamaCppAdapter
+from lexi_align.adapters.outlines_adapter import OutlinesAdapter
+from lexi_align.core import (
+    MetricsDict,
+    ValidationErrorStats,
+    align_tokens,
+    align_tokens_async,
+    align_tokens_batched,
+    categorize_validation_errors,
+)
+from lexi_align.metrics import Metrics, calculate_metrics
+from lexi_align.models import (
+    AlignmentResult,
+    TextAlignment,
+    TokenMapping,
+    ValidationErrorType,
+)
+from lexi_align.text_processing import (
+    MarkerGenerator,
+    create_subscript_generator,
+    create_underscore_generator,
+)
+from lexi_align.utils import (
+    create_token_mapping,
+    parse_case_line,  # NEW
+    read_pharaoh_file,
+    remove_unique_one,
+    validate_token_lists,
+)
+from lexi_align.visualize import visualize_alignments
+
+
+def _accumulate_result(
+    metrics: Optional[Metrics],
+    alignment_data: dict | None,
+    diag: dict[str, Any],
+    counters: dict[str, int],
+    val_err_stats: dict,
+    exception_counts: dict[str, int],
+    alignments_data: list[dict],
+):
+    """
+    Update global counters & storage from one example.
+    counters keys: 'tp','pred','gold','failed','attempts','val_errs'
+    """
+    if metrics and alignment_data:
+        counters["tp"] += metrics["true_positives"]
+        counters["pred"] += metrics["predicted"]
+        counters["gold"] += metrics["gold"]
+        alignments_data.append(alignment_data)
+    else:
+        counters["failed"] += 1
+
+    # merge diagnostics
+    counters["attempts"] += diag["total_attempts"]
+    counters["val_errs"] += diag["total_validation_errors"]
+    for et, stats in diag["validation_error_stats"].items():
+        val_err_stats[et]["count"] += stats["count"]
+        for tok, freq in stats["frequencies"].items():
+            val_err_stats[et]["frequencies"][tok] = (
+                val_err_stats[et]["frequencies"].get(tok, 0) + freq
+            )
+    for exc, cnt in diag["exception_counts"].items():
+        exception_counts[exc] = exception_counts.get(exc, 0) + cnt
+
+
+def _summarize_alignment_result(alignment_result: AlignmentResult) -> dict[str, Any]:
+    """
+    Extract micro diagnostics from a single AlignmentResult.
+    Returns a dict with keys:
+      total_attempts, total_validation_errors,
+      exception_counts (dict), validation_error_stats (dict)
+    """
+    total_attempts = len(alignment_result.attempts)
+    total_validation_errors = sum(
+        1 for a in alignment_result.attempts if not a.validation_passed
+    )
+
+    # Count exceptions by type
+    exc_counter: Counter[str] = Counter()
+    for a in alignment_result.attempts:
+        if a.exception:
+            et = a.exception.split(":", 1)[0].strip()
+            exc_counter[et] += 1
+
+    # Flatten all validation_error tuples and re‑categorize
+    all_errors = [err for a in alignment_result.attempts for err in a.validation_errors]
+    val_err_stats = categorize_validation_errors(all_errors)
+
+    return {
+        "total_attempts": total_attempts,
+        "total_validation_errors": total_validation_errors,
+        "exception_counts": dict(exc_counter),
+        "validation_error_stats": val_err_stats,
+    }
+
+
+def build_final_metrics(
+    total_true_positives: int,
+    total_predicted: int,
+    total_gold: int,
+    total_attempts: int,
+    total_validation_errors: int,
+    failed_calls: int,
+    n_examples: int,
+    validation_error_stats: dict[ValidationErrorType, ValidationErrorStats],
+    exception_counts: dict[str, int],
+) -> MetricsDict:
+    micro_precision = (
+        total_true_positives / total_predicted if total_predicted > 0 else 0.0
+    )
+    micro_recall = total_true_positives / total_gold if total_gold > 0 else 0.0
+    micro_aer = (
+        1.0 - ((total_true_positives * 2) / (total_predicted + total_gold))
+        if (total_predicted + total_gold) > 0
+        else 1.0
+    )
+    if micro_precision > 0 and micro_recall > 0:
+        f_divident = (0.5 / micro_precision) + (0.5 / micro_recall)
+        micro_f = 1.0 / f_divident
+    else:
+        micro_f = 0.0
+    return {
+        "precision": micro_precision,
+        "recall": micro_recall,
+        "f_measure": micro_f,
+        "aer": micro_aer,
+        "total_predicted": total_predicted,
+        "total_gold": total_gold,
+        "total_true_positives": total_true_positives,
+        "diagnostics": {
+            "total_attempts": total_attempts,
+            "total_validation_errors": total_validation_errors,
+            "avg_attempts_per_pair": (total_attempts / (n_examples - failed_calls))
+            if n_examples > failed_calls
+            else 0,
+            "validation_error_stats": {
+                ValidationErrorType(error_type.value): {
+                    "count": stats["count"],
+                    "frequencies": stats["frequencies"],
+                }
+                for error_type, stats in validation_error_stats.items()
+                if isinstance(stats, dict)
+                and isinstance(stats.get("count"), int)
+                and stats["count"] > 0
+            },
+            "exception_types": exception_counts,
+            "failed_calls": failed_calls,
+            "failure_rate": (failed_calls / n_examples) if n_examples else 0.0,
+        },
+    }
 
 
 def setup_logging(verbosity: int = 0):
@@ -26,8 +186,8 @@ def setup_logging(verbosity: int = 0):
     # Define log levels
     log_levels = {
         0: "WARNING",  # default
-        1: "INFO",     # -v
-        2: "DEBUG",    # -vv
+        1: "INFO",  # -v
+        2: "DEBUG",  # -vv
     }
     level = log_levels[min(verbosity, 2)]
 
@@ -42,12 +202,7 @@ def setup_logging(verbosity: int = 0):
     )
 
     # Add loguru handler
-    logger.add(
-        sys.stderr,
-        format=log_format,
-        level=level,
-        colorize=True
-    )
+    logger.add(sys.stderr, format=log_format, level=level, colorize=True)
 
     # Create handler that routes standard logging to loguru
     class InterceptHandler(logging.Handler):
@@ -59,7 +214,8 @@ def setup_logging(verbosity: int = 0):
                 level = record.levelno
 
             # Find caller from where originated the logged message
-            frame, depth = sys._getframe(6), 6
+            frame: Optional[FrameType] = sys._getframe(6)
+            depth = 6
             while frame and frame.f_code.co_filename == logging.__file__:
                 frame = frame.f_back
                 depth += 1
@@ -76,39 +232,6 @@ def setup_logging(verbosity: int = 0):
 
     # Set level for root logger
     logging.root.setLevel(level)
-from matplotlib.backends.backend_pdf import PdfPages
-from scipy.stats import binomtest  # type: ignore
-from tqdm import tqdm  # type: ignore
-
-from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
-from lexi_align.adapters.llama_cpp_adapter import LlamaCppAdapter
-from lexi_align.adapters.outlines_adapter import OutlinesAdapter
-from lexi_align.core import (
-    MetricsDict,
-    ValidationErrorStats,
-    align_tokens,
-    align_tokens_batched,
-)
-from lexi_align.metrics import calculate_metrics
-from lexi_align.models import (
-    AlignmentResult,
-    TextAlignment,
-    TokenMapping,
-    ValidationErrorType,
-)
-from lexi_align.text_processing import (
-    MarkerGenerator,
-    create_subscript_generator,
-    create_underscore_generator,
-)
-from lexi_align.utils import (
-    create_token_mapping,
-    parse_pharaoh_format,
-    read_pharaoh_file,
-    remove_unique_one,
-    validate_token_lists,
-)
-from lexi_align.visualize import visualize_alignments
 
 
 class TokenStats(TypedDict):
@@ -153,79 +276,67 @@ def analyze_token_alignments(
         >>> stats["target"]["chat"]["correct"]
         1
     """
-    # Track per-token statistics using full tokens (with markers)
-    source_stats: DefaultDict[str, Dict[str, Any]] = defaultdict(
-        lambda: {"correct": 0, "incorrect": 0, "missed": 0, "extra": 0}
-    )
-    target_stats: DefaultDict[str, Dict[str, Any]] = defaultdict(
-        lambda: {"correct": 0, "incorrect": 0, "missed": 0, "extra": 0}
-    )
-
-    # Get alignment pairs directly
+    # build pair‐sets
     pred_pairs = {(a.source, a.target) for a in predicted.alignment}
     gold_pairs = {(a.source, a.target) for a in gold.alignment}
 
-    # Find correct alignments (true positives)
-    for src, tgt in pred_pairs & gold_pairs:
-        source_stats[src]["correct"] += 1
-        target_stats[tgt]["correct"] += 1
+    def side(idx: int) -> dict[str, TokenStats]:
+        stats: dict[str, TokenStats] = {}
+        # all tokens appearing on this side in either pred or gold
+        tokens = {p[idx] for p in pred_pairs | gold_pairs}
+        for t in tokens:
+            tp = sum(1 for p in (pred_pairs & gold_pairs) if p[idx] == t)
+            fp = sum(1 for p in (pred_pairs - gold_pairs) if p[idx] == t)
+            fn = sum(1 for p in (gold_pairs - pred_pairs) if p[idx] == t)
+            acc = tp / (tp + fp) if (tp + fp) else 0.0
+            cov = tp / (tp + fn) if (tp + fn) else 0.0
+            stats[t] = {
+                "correct": tp,
+                "incorrect": fp,
+                "missed": fn,
+                "extra": 0,
+                "alignment_ratio": (tp + fp) / max(tp + fn, 1),
+                "accuracy": acc,
+                "coverage": cov,
+            }
+        return stats
 
-    # Find incorrect alignments (false positives)
-    for src, tgt in pred_pairs - gold_pairs:
-        source_stats[src]["incorrect"] += 1
-        target_stats[tgt]["incorrect"] += 1
-
-    # Find missed alignments (false negatives)
-    for src, tgt in gold_pairs - pred_pairs:
-        source_stats[src]["missed"] += 1
-        target_stats[tgt]["missed"] += 1
-
-    # Calculate alignment ratios
-    for stats in [source_stats, target_stats]:
-        for token_stats in stats.values():
-            token_stats["alignment_ratio"] = float(
-                (token_stats["correct"] + token_stats["incorrect"])
-                / max(token_stats["correct"] + token_stats["missed"], 1)
-            )
-
-    return {
-        "source": cast(Dict[str, TokenStats], dict(source_stats)),
-        "target": cast(Dict[str, TokenStats], dict(target_stats)),
-    }
+    return {"source": side(0), "target": side(1)}
 
 
 def aggregate_token_statistics(
     all_stats: list[dict],
 ) -> dict[str, Dict[str, TokenStats]]:
     """Aggregate token statistics across multiple examples."""
-    combined_stats: Dict[str, DefaultDict[str, Dict[str, Any]]] = {
-        "source": defaultdict(
-            lambda: {"correct": 0, "incorrect": 0, "missed": 0, "extra": 0}
-        ),
-        "target": defaultdict(
-            lambda: {"correct": 0, "incorrect": 0, "missed": 0, "extra": 0}
-        ),
-    }
 
-    # Combine stats
-    for stats in all_stats:
-        for lang in ["source", "target"]:
-            for token, token_stats in stats[lang].items():
-                for key in ["correct", "incorrect", "missed", "extra"]:
-                    combined_stats[lang][token][key] += token_stats[key]
-
-    # Calculate final metrics
-    for lang in ["source", "target"]:
-        for token, stats in combined_stats[lang].items():
-            total_gold = stats["correct"] + stats["missed"]
-            total_pred = stats["correct"] + stats["incorrect"]
-            stats["accuracy"] = float(stats["correct"] / max(total_pred, 1))
-            stats["coverage"] = float(stats["correct"] / max(total_gold, 1))
-            stats["alignment_ratio"] = float(total_pred / max(total_gold, 1))
+    # helper to aggregate one side
+    def _agg_side(lang: str) -> dict[str, TokenStats]:
+        stats_out: dict[str, TokenStats] = {}
+        # collect all tokens seen for this side
+        tokens = {tok for st in all_stats for tok in st.get(lang, {})}
+        for tok in tokens:
+            c = sum(st.get(lang, {}).get(tok, {}).get("correct", 0) for st in all_stats)
+            i = sum(
+                st.get(lang, {}).get(tok, {}).get("incorrect", 0) for st in all_stats
+            )
+            m = sum(st.get(lang, {}).get(tok, {}).get("missed", 0) for st in all_stats)
+            e = sum(st.get(lang, {}).get(tok, {}).get("extra", 0) for st in all_stats)
+            total_gold = c + m
+            total_pred = c + i
+            stats_out[tok] = {
+                "correct": c,
+                "incorrect": i,
+                "missed": m,
+                "extra": e,
+                "accuracy": float(c / max(total_pred, 1)),
+                "coverage": float(c / max(total_gold, 1)),
+                "alignment_ratio": float(total_pred / max(total_gold, 1)),
+            }
+        return stats_out
 
     return {
-        "source": cast(Dict[str, TokenStats], dict(combined_stats["source"])),
-        "target": cast(Dict[str, TokenStats], dict(combined_stats["target"])),
+        "source": _agg_side("source"),
+        "target": _agg_side("target"),
     }
 
 
@@ -400,8 +511,8 @@ def create_alignment_visualizations(results_files: list[str], pdf_path: str) -> 
             source_tokens, target_tokens, lang_pair = key
             alignments = all_alignments[key]
 
-            # Only visualize if we have multiple models (including gold)
-            if len(alignments) > 2:  # More than just gold + one model
+            # Visualize when we have at least Gold + one model
+            if len(alignments) >= 2:  # Gold + >= 1 model
                 # Calculate metrics comparing each model to Gold
                 metrics_str = ""
                 for model_id in sorted(alignments.keys()):
@@ -567,9 +678,17 @@ def analyze_token_statistics(alignments_data: list[dict]) -> dict:
 
 
 def evaluate_results(
-    results_files: list[str], output_path: Optional[str] = None
+    results_files: list[str],
+    output_base: Optional[str] = None,
+    html_path: Optional[str] = None,
 ) -> str:
-    """Generate markdown table and plots comparing results from multiple JSON files."""
+    """Generate markdown table and plots comparing results from multiple JSON files.
+
+    Args:
+        results_files: List of input JSON result files
+        output_base: Base filename (no extension). If provided, saves <base>.png.
+        html_path: Optional path to save interactive Altair HTML output.
+    """
     all_results = {}
     metrics_data = []  # For plotting
 
@@ -604,7 +723,7 @@ def evaluate_results(
 
     # Create DataFrame for plotting
     df = pd.DataFrame(metrics_data)
-    print(df)
+    logger.debug("Metrics DataFrame head:\n%s", df.head())
 
     # Create distribution plots
     plt.figure(figsize=(15, 8))  # Increased figure size
@@ -715,9 +834,9 @@ def evaluate_results(
 
         tables.append("\n".join(table))
 
-    # Save plot if output path provided
-    if output_path:
-        plot_path = output_path.replace(".md", ".png")
+    # Save plot if output base provided
+    if output_base:
+        plot_path = ensure_extension(output_base, "png")
         plt.savefig(plot_path, bbox_inches="tight", dpi=300)
         plt.close()
 
@@ -819,6 +938,25 @@ def evaluate_results(
                     tables.append(f"`{token}` | {freq} | {percentage:.1f}%")
                 tables.append("")  # Empty line after table
 
+    # Optional Altair HTML export for interactive plots
+    if html_path:
+        try:
+            import altair as alt  # local import to keep dependency optional
+
+            chart = (
+                alt.Chart(df)
+                .mark_boxplot(size=40, ticks=True)
+                .encode(
+                    x=alt.X("Model:N", axis=alt.Axis(labelAngle=-30)),
+                    y=alt.Y("f_measure:Q"),
+                    color="Model:N",
+                )
+                .properties(width=600, height=300, title="f_measure by model")
+            )
+            chart.save(html_path)
+        except Exception as e:
+            logger.warning("Altair HTML export failed: %s", e)
+
     return "\n".join(tables)
 
 
@@ -832,6 +970,10 @@ def get_run_parameters(args: argparse.Namespace) -> dict:
         "num_train_examples": args.num_train_examples,
         "sample_size": args.sample_size,
         "marker_type": args.marker_type,
+        "use_async": getattr(args, "use_async", False),
+        "concurrency": getattr(args, "concurrency", None),
+        "presence_penalty": getattr(args, "presence_penalty", None),
+        "min_p": getattr(args, "min_p", None),
     }
 
 
@@ -868,6 +1010,15 @@ def ensure_extension(filepath: str, extension: str) -> str:
     return filepath
 
 
+def strip_known_output_extension(filepath: str) -> str:
+    """Remove only known output extensions; keep dots in base names."""
+    lower = filepath.lower()
+    for ext in ("md", "png", "html", "pdf"):
+        if lower.endswith(f".{ext}"):
+            return filepath[: -(len(ext) + 1)]
+    return filepath
+
+
 def get_language_pairs(lang_pairs: Optional[List[str]]) -> List[str]:
     """Validate and return language pairs to evaluate."""
     if lang_pairs is None:
@@ -883,7 +1034,10 @@ def get_language_pairs(lang_pairs: Optional[List[str]]) -> List[str]:
 
 
 def load_training_examples(
-    repo_path: Path, lang_pair: str, num_examples: Optional[int] = None
+    repo_path: Path,
+    lang_pair: str,
+    num_examples: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> List[Tuple[List[str], List[str], TextAlignment]]:
     """Load training examples for a language pair."""
     target_lang = lang_pair.split("-")[1].lower()
@@ -897,7 +1051,8 @@ def load_training_examples(
         examples = read_pharaoh_file(str(train_file))
 
         if num_examples is not None:
-            examples = random.sample(examples, min(num_examples, len(examples)))
+            local_rng = random.Random(seed)
+            examples = local_rng.sample(examples, min(num_examples, len(examples)))
 
         # Convert to expected format with tokenized lists
         return [(src.split(), tgt.split(), align) for src, tgt, align in examples]
@@ -930,7 +1085,7 @@ def evaluate_language_pair(
     training_examples = None
     if args.num_train_examples is not None:
         training_examples = load_training_examples(
-            repo_path, lang_pair, args.num_train_examples
+            repo_path, lang_pair, args.num_train_examples, seed=args.seed
         )
         logger.info(f"Loaded {len(training_examples)} training examples")
 
@@ -938,10 +1093,11 @@ def evaluate_language_pair(
         test_cases = f.readlines()
 
     if args.sample_size and len(test_cases) > args.sample_size:
-        test_cases = test_cases[: args.sample_size]
+        rng = random.Random(args.seed)
+        test_cases = rng.sample(test_cases, args.sample_size)
 
     # Process in batches if batch size is specified
-    if args.batch_size and hasattr(llm_adapter, "batch"):
+    if args.batch_size and llm_adapter.supports_true_batching():
         logger.info(f"Processing in batches of size {args.batch_size}")
         return _evaluate_language_pair_batch(
             test_cases,
@@ -952,6 +1108,20 @@ def evaluate_language_pair(
             marker_generator,
         )
     else:
+        if getattr(args, "use_async", False):
+            logger.info(
+                f"Processing examples sequentially (async, concurrency={args.concurrency or 8})"
+            )
+            return asyncio.run(
+                _evaluate_language_pair_sequential_async(
+                    test_cases,
+                    lang_pair,
+                    llm_adapter,
+                    args,
+                    training_examples,
+                    marker_generator,
+                )
+            )
         logger.info("Processing examples sequentially")
         return _evaluate_language_pair_sequential(
             test_cases,
@@ -970,7 +1140,7 @@ def _process_alignment_result(
     target_tokens: list[str],
     source_mapping: TokenMapping,
     target_mapping: TokenMapping,
-) -> tuple[Optional[dict], Optional[dict]]:
+) -> tuple[Optional[Metrics], Optional[dict[str, Any]]]:
     """Process a single alignment result and return metrics and alignment data.
 
     Returns:
@@ -1040,24 +1210,25 @@ def _evaluate_language_pair_sequential(
         error_type: {"count": 0, "frequencies": {}}
         for error_type in ValidationErrorType
     }
-    alignments_data = []
+    alignments_data: list[dict[str, Any]] = []
 
     for i, line in enumerate(tqdm(test_cases, desc=f"Processing {lang_pair}"), 1):
         try:
-            source_sent, target_sent, gold_alignment = parse_pharaoh_format(line)
-            source_tokens = source_sent.split()
-            target_tokens = target_sent.split()
-
-            # Create token mappings once and reuse
-            source_mapping = create_token_mapping(source_tokens, marker_generator)
-            target_mapping = create_token_mapping(target_tokens, marker_generator)
+            (
+                source_tokens,
+                target_tokens,
+                gold_alignment,
+                source_mapping,
+                target_mapping,
+            ) = parse_case_line(line, marker_generator or create_subscript_generator())
 
             logger.debug(
-                f"Processing example {i}:\n  Source: {source_sent}\n  Target: {target_sent}\n"
+                f"Processing example {i}:\n  Source: {' '.join(source_tokens)}\n  Target: {' '.join(target_tokens)}\n"
                 f"  Unique source: {' '.join(source_mapping.uniquified)}\n"
                 f"  Unique target: {' '.join(target_mapping.uniquified)}"
             )
 
+            start = time.perf_counter()
             alignment_result = align_tokens(
                 llm_adapter,
                 source_mapping.uniquified,  # Use pre-uniquified tokens
@@ -1068,6 +1239,7 @@ def _evaluate_language_pair_sequential(
                 marker_generator=marker_generator,
                 max_retries=args.max_retries,
             )
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
 
             metrics, alignment_data = _process_alignment_result(
                 alignment_result,
@@ -1077,34 +1249,33 @@ def _evaluate_language_pair_sequential(
                 source_mapping,
                 target_mapping,
             )
+            if alignment_data is not None:
+                alignment_data["elapsed_ms"] = round(elapsed_ms, 3)
 
-            if metrics and alignment_data:
-                # Update counters
-                total_true_positives += metrics["true_positives"]
-                total_predicted += metrics["predicted"]
-                total_gold += metrics["gold"]
-                alignments_data.append(alignment_data)
-            else:
-                failed_calls += 1
-
-            # Update diagnostic counters
-            total_attempts += len(alignment_result.attempts)
-            for attempt in alignment_result.attempts:
-                if not attempt.validation_passed:
-                    total_validation_errors += 1
-                    for error_type, _description, tokens in attempt.validation_errors:
-                        validation_error_stats[error_type]["count"] += 1
-                        # Update frequencies for each token
-                        for token in tokens:
-                            validation_error_stats[error_type]["frequencies"][token] = (
-                                validation_error_stats[error_type]["frequencies"].get(
-                                    token, 0
-                                )
-                                + 1
-                            )
-                if attempt.exception:
-                    exc_type = attempt.exception.split(":")[0].strip()
-                    exception_counts[exc_type] = exception_counts.get(exc_type, 0) + 1
+            counters = {
+                "tp": total_true_positives,
+                "pred": total_predicted,
+                "gold": total_gold,
+                "failed": failed_calls,
+                "attempts": total_attempts,
+                "val_errs": total_validation_errors,
+            }
+            _accumulate_result(
+                metrics,
+                alignment_data,
+                _summarize_alignment_result(alignment_result),
+                counters=counters,
+                val_err_stats=validation_error_stats,
+                exception_counts=exception_counts,
+                alignments_data=alignments_data,
+            )
+            # then unpack counters back
+            total_true_positives = counters["tp"]
+            total_predicted = counters["pred"]
+            total_gold = counters["gold"]
+            failed_calls = counters["failed"]
+            total_attempts = counters["attempts"]
+            total_validation_errors = counters["val_errs"]
 
         except Exception as e:
             logger.error(
@@ -1116,56 +1287,158 @@ def _evaluate_language_pair_sequential(
             failed_calls += 1
             continue
 
-    # Calculate micro-averaged metrics with enhanced diagnostics
-    micro_precision = (
-        total_true_positives / total_predicted if total_predicted > 0 else 0.0
+    final_metrics: MetricsDict = build_final_metrics(
+        total_true_positives=total_true_positives,
+        total_predicted=total_predicted,
+        total_gold=total_gold,
+        total_attempts=total_attempts,
+        total_validation_errors=total_validation_errors,
+        failed_calls=failed_calls,
+        n_examples=len(test_cases),
+        validation_error_stats=validation_error_stats,
+        exception_counts=exception_counts,
     )
-    micro_recall = total_true_positives / total_gold if total_gold > 0 else 0.0
+    return final_metrics, alignments_data
 
-    # Calculate AER
-    micro_aer = (
-        1.0 - ((total_true_positives * 2) / (total_predicted + total_gold))
-        if (total_predicted + total_gold) > 0
-        else 1.0
-    )
 
-    # Calculate weighted F-measure with α=0.5 (equivalent to f_measure)
-    if micro_precision > 0 and micro_recall > 0:
-        f_divident = (0.5 / micro_precision) + (0.5 / micro_recall)
-        micro_f_measure = 1.0 / f_divident
-    else:
-        micro_f_measure = 0.0
+async def _evaluate_language_pair_sequential_async(
+    test_cases: list[str],
+    lang_pair: str,
+    llm_adapter: Union[LiteLLMAdapter, OutlinesAdapter, LlamaCppAdapter],
+    args: argparse.Namespace,
+    training_examples: Optional[
+        List[Tuple[List[str], List[str], TextAlignment]]
+    ] = None,
+    marker_generator: Optional[MarkerGenerator] = None,
+) -> tuple[MetricsDict, list[dict]]:
+    """Process test cases sequentially using asyncio with bounded concurrency."""
+    target_lang_code = lang_pair.split("-")[1]
+    target_lang = LANGUAGE_MAP.get(target_lang_code, target_lang_code)
 
-    final_metrics: MetricsDict = {
-        "precision": micro_precision,
-        "recall": micro_recall,
-        "f_measure": micro_f_measure,
-        "aer": micro_aer,
-        "total_predicted": total_predicted,
-        "total_gold": total_gold,
-        "total_true_positives": total_true_positives,
-        "diagnostics": {
-            "total_attempts": total_attempts,
-            "total_validation_errors": total_validation_errors,
-            "avg_attempts_per_pair": total_attempts / (len(test_cases) - failed_calls)
-            if len(test_cases) > failed_calls
-            else 0,
-            "validation_error_stats": {
-                ValidationErrorType(error_type.value): {
-                    "count": stats["count"],
-                    "frequencies": stats["frequencies"],
-                }
-                for error_type, stats in validation_error_stats.items()
-                if isinstance(stats, dict)
-                and isinstance(stats.get("count"), int)
-                and stats["count"] > 0
-            },
-            "exception_types": exception_counts,
-            "failed_calls": failed_calls,
-            "failure_rate": failed_calls / len(test_cases) if test_cases else 0,
-        },
+    # Accumulators
+    total_true_positives = 0
+    total_predicted = 0
+    total_gold = 0
+    failed_calls = 0
+    total_attempts = 0
+    total_validation_errors = 0
+    exception_counts: dict[str, int] = {}
+    validation_error_stats: dict[ValidationErrorType, ValidationErrorStats] = {
+        error_type: {"count": 0, "frequencies": {}}
+        for error_type in ValidationErrorType
     }
+    alignments_data: list[dict] = []
 
+    # Marker generator default
+    if marker_generator is None:
+        marker_generator = create_subscript_generator()
+
+    sem = asyncio.Semaphore(args.concurrency or 8)
+
+    async def process_one(idx: int, line: str):
+        try:
+            (
+                source_tokens,
+                target_tokens,
+                gold_alignment,
+                source_mapping,
+                target_mapping,
+            ) = parse_case_line(line, marker_generator)
+
+            start = time.perf_counter()
+            async with sem:
+                alignment_result = await align_tokens_async(
+                    llm_adapter,
+                    source_mapping.uniquified,
+                    target_mapping.uniquified,
+                    source_language="English",
+                    target_language=target_lang,
+                    examples=training_examples,
+                    max_retries=args.max_retries,
+                    marker_generator=marker_generator,
+                )
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+            metrics, alignment_data = _process_alignment_result(
+                alignment_result,
+                gold_alignment,
+                source_tokens,
+                target_tokens,
+                source_mapping,
+                target_mapping,
+            )
+            if alignment_data is not None:
+                alignment_data["elapsed_ms"] = round(elapsed_ms, 3)
+            return (alignment_result, metrics, alignment_data)
+        except Exception as e:
+            logger.error(
+                f"Unexpected error processing example {idx}:\n"
+                f"  Raw line: {line!r}\n"
+                f"  Error type: {type(e).__name__}\n"
+                f"  Error: {str(e)}"
+            )
+            return (None, None, None)
+
+    # Launch all tasks and show progress as they complete
+    tasks = [process_one(i, line) for i, line in enumerate(test_cases, 1)]
+    results: list[tuple] = []
+    with tqdm(
+        total=len(test_cases),
+        desc=f"Processing {lang_pair} (async)",
+        dynamic_ncols=True,
+        leave=True,
+    ) as pbar:
+        for coro in asyncio.as_completed(tasks):
+            results.append(await coro)
+            pbar.update(1)
+
+    # Aggregate
+    for alignment_result, metrics, alignment_data in results:
+        if alignment_result is not None:
+            diag = _summarize_alignment_result(alignment_result)
+        else:
+            diag = {
+                "total_attempts": 0,
+                "total_validation_errors": 0,
+                "exception_counts": {},
+                "validation_error_stats": categorize_validation_errors([]),
+            }
+        counters = {
+            "tp": total_true_positives,
+            "pred": total_predicted,
+            "gold": total_gold,
+            "failed": failed_calls,
+            "attempts": total_attempts,
+            "val_errs": total_validation_errors,
+        }
+        _accumulate_result(
+            metrics,
+            alignment_data,
+            diag,
+            counters=counters,
+            val_err_stats=validation_error_stats,
+            exception_counts=exception_counts,
+            alignments_data=alignments_data,
+        )
+        # unpack updated counters
+        total_true_positives = counters["tp"]
+        total_predicted = counters["pred"]
+        total_gold = counters["gold"]
+        failed_calls = counters["failed"]
+        total_attempts = counters["attempts"]
+        total_validation_errors = counters["val_errs"]
+
+    final_metrics: MetricsDict = build_final_metrics(
+        total_true_positives=total_true_positives,
+        total_predicted=total_predicted,
+        total_gold=total_gold,
+        total_attempts=total_attempts,
+        total_validation_errors=total_validation_errors,
+        failed_calls=failed_calls,
+        n_examples=len(test_cases),
+        validation_error_stats=validation_error_stats,
+        exception_counts=exception_counts,
+    )
     return final_metrics, alignments_data
 
 
@@ -1195,7 +1468,7 @@ def _evaluate_language_pair_batch(
         error_type: {"count": 0, "frequencies": {}}
         for error_type in ValidationErrorType
     }
-    alignments_data = []
+    alignments_data: list[dict[str, Any]] = []
     # TODO most and least correctly aligned tokens
     # TODO most over-aligned and under-aligned tokens
 
@@ -1215,23 +1488,23 @@ def _evaluate_language_pair_batch(
     # Add progress bar for parsing phase
     for line in tqdm(test_cases, desc=f"Parsing {lang_pair} test cases"):
         try:
-            source_sent, target_sent, gold_alignment = parse_pharaoh_format(line)
-            source_tokens = source_sent.split()
-            target_tokens = target_sent.split()
+            (
+                source_tokens,
+                target_tokens,
+                gold_alignment,
+                source_mapping,
+                target_mapping,
+            ) = parse_case_line(line, marker_generator)
 
             # Store tokens
             source_tokens_list.append(source_tokens)
             target_tokens_list.append(target_tokens)
 
             # Create and store mappings
-            source_mapping = create_token_mapping(source_tokens, marker_generator)
-            target_mapping = create_token_mapping(target_tokens, marker_generator)
-
             source_batch.append(source_mapping.uniquified)
             target_batch.append(target_mapping.uniquified)
             gold_alignments.append(gold_alignment)
-            source_mappings.append(source_mapping)
-            target_mappings.append(target_mapping)
+            # Only append once per example
             source_mappings.append(source_mapping)
             target_mappings.append(target_mapping)
         except Exception as e:
@@ -1277,41 +1550,30 @@ def _evaluate_language_pair_batch(
                             target_mappings[batch_idx],
                         )
 
-                        if metrics and alignment_data:
-                            # Update counters
-                            total_true_positives += metrics["true_positives"]
-                            total_predicted += metrics["predicted"]
-                            total_gold += metrics["gold"]
-                            alignments_data.append(alignment_data)
-                        else:
-                            failed_calls += 1
-
-                        # Update diagnostic counters
-                        total_attempts += len(result.attempts)
-                        for attempt in result.attempts:
-                            if not attempt.validation_passed:
-                                total_validation_errors += 1
-                                for (
-                                    error_type,
-                                    description,
-                                    tokens,
-                                ) in attempt.validation_errors:
-                                    validation_error_stats[error_type]["count"] += 1
-                                    # Update frequencies for each token
-                                    for token in tokens:
-                                        validation_error_stats[error_type][
-                                            "frequencies"
-                                        ][token] = (
-                                            validation_error_stats[error_type][
-                                                "frequencies"
-                                            ].get(token, 0)
-                                            + 1
-                                        )
-                            if attempt.exception:
-                                exc_type = attempt.exception.split(":")[0].strip()
-                                exception_counts[exc_type] = (
-                                    exception_counts.get(exc_type, 0) + 1
-                                )
+                        counters = {
+                            "tp": total_true_positives,
+                            "pred": total_predicted,
+                            "gold": total_gold,
+                            "failed": failed_calls,
+                            "attempts": total_attempts,
+                            "val_errs": total_validation_errors,
+                        }
+                        _accumulate_result(
+                            metrics,
+                            alignment_data,
+                            _summarize_alignment_result(result),
+                            counters=counters,
+                            val_err_stats=validation_error_stats,
+                            exception_counts=exception_counts,
+                            alignments_data=alignments_data,
+                        )
+                        # then unpack counters back
+                        total_true_positives = counters["tp"]
+                        total_predicted = counters["pred"]
+                        total_gold = counters["gold"]
+                        failed_calls = counters["failed"]
+                        total_attempts = counters["attempts"]
+                        total_validation_errors = counters["val_errs"]
 
                     except Exception as e:
                         failed_calls += 1
@@ -1327,51 +1589,17 @@ def _evaluate_language_pair_batch(
         failed_calls += len(source_batch)
         logger.error(f"Batch processing error: {str(e)}")
 
-    # Calculate metrics
-    final_metrics: MetricsDict = {
-        "precision": total_true_positives / total_predicted
-        if total_predicted > 0
-        else 0.0,
-        "recall": total_true_positives / total_gold if total_gold > 0 else 0.0,
-        "f_measure": (2 * total_true_positives / (total_predicted + total_gold))
-        if (total_predicted + total_gold) > 0
-        else 0.0,
-        "aer": (1.0 - ((2 * total_true_positives) / (total_predicted + total_gold)))
-        if (total_predicted + total_gold) > 0
-        else 1.0,  # If no alignments, AER is 1.0 (worst case)
-        "total_predicted": total_predicted,
-        "total_gold": total_gold,
-        "total_true_positives": total_true_positives,
-        "diagnostics": {
-            "total_attempts": total_attempts,
-            "total_validation_errors": total_validation_errors,
-            "avg_attempts_per_pair": total_attempts / (len(test_cases) - failed_calls)
-            if len(test_cases) > failed_calls
-            else 0,
-            "validation_error_stats": {
-                ValidationErrorType(error_type): {
-                    "count": stats["count"],
-                    "frequencies": dict(
-                        sorted(
-                            stats["frequencies"].items(),
-                            key=lambda x: (
-                                -x[1],
-                                x[0],
-                            ),  # Sort by frequency desc, then token asc
-                        )
-                    ),
-                }
-                for error_type, stats in validation_error_stats.items()
-                if isinstance(stats, dict)
-                and isinstance(stats.get("count"), int)
-                and stats["count"] > 0
-            },
-            "exception_types": exception_counts,
-            "failed_calls": failed_calls,
-            "failure_rate": failed_calls / len(test_cases) if test_cases else 0,
-        },
-    }
-
+    final_metrics: MetricsDict = build_final_metrics(
+        total_true_positives=total_true_positives,
+        total_predicted=total_predicted,
+        total_gold=total_gold,
+        total_attempts=total_attempts,
+        total_validation_errors=total_validation_errors,
+        failed_calls=failed_calls,
+        n_examples=len(test_cases),
+        validation_error_stats=validation_error_stats,
+        exception_counts=exception_counts,
+    )
     return final_metrics, alignments_data
 
 
@@ -1400,9 +1628,34 @@ def main():
     analyze_parser.add_argument("--model", default="gpt-4", help="LLM model to use")
     analyze_parser.add_argument(
         "--adapter",
-        choices=list(ADAPTER_TYPES.keys()),
+        choices=list(ADAPTER_TYPES.keys()) + ["sglang"],
         default="litellm",
-        help="Adapter type to use (litellm, outlines, or llama-cpp)",
+        help="Adapter type to use (litellm, outlines, llama-cpp, or sglang)",
+    )
+    analyze_parser.add_argument(
+        "--sglang-url",
+        dest="sglang_url",
+        help="Base URL of the SGLang OpenAI-compatible server (e.g., http://localhost:11434)",
+    )
+    analyze_parser.add_argument(
+        "--sglang-api-key",
+        dest="sglang_api_key",
+        help="API key for the SGLang server (optional)",
+    )
+    analyze_parser.add_argument(
+        "--sglang-client-kwargs",
+        type=json.loads,
+        help="JSON dict of kwargs for OpenAI client init (optional)",
+    )
+    analyze_parser.add_argument(
+        "--sglang-generation-kwargs",
+        type=json.loads,
+        help="JSON dict of extra kwargs forwarded to chat.completions (optional)",
+    )
+    analyze_parser.add_argument(
+        "--sglang-extra-body",
+        type=json.loads,
+        help="JSON dict passed under 'extra_body' for SGLang (optional)",
     )
     analyze_parser.add_argument(
         "--use-gpu",
@@ -1436,12 +1689,24 @@ def main():
         "--samples",
         type=int,
         default=1,
-        help="Number of samples for multinomial sampling (outlines only)",
+        help="Number of samples for multinomial sampling (where supported: outlines, sglang)",
+    )
+    analyze_parser.add_argument(
+        "--async",
+        dest="use_async",
+        action="store_true",
+        help="Use asyncio for per-example processing (sequential mode). Ignored when true batching is used.",
+    )
+    analyze_parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=8,
+        help="Max concurrent async requests in --async mode (default: 8)",
     )
     analyze_parser.add_argument(
         "--model-device",
         choices=["cuda", "cpu"],
-        help="Device to run model on (default: auto-detect)",
+        help="Device to run model on (transformers-based local models: outlines; default: auto-detect)",
     )
     analyze_parser.add_argument(
         "--model-kwargs",
@@ -1461,22 +1726,33 @@ def main():
         "--model-dtype",
         choices=["float32", "float16", "bfloat16", "int8", "int4"],
         default="bfloat16",
-        help="Data type for model weights (outlines only)",
+        help="Data type for model weights (transformers-based local models: outlines)",
     )
     analyze_parser.add_argument(
         "--beam-size",
         type=int,
-        help="Number of beams for beam search (outlines only, overrides other sampling parameters)",
+        help="Number of beams for beam search (where supported: outlines, sglang; overrides other sampling parameters)",
     )
     analyze_parser.add_argument(
         "--top-k",
         type=int,
-        help="Top-k filtering parameter (outlines only)",
+        help="Top-k filtering parameter (where supported: outlines, sglang)",
     )
     analyze_parser.add_argument(
         "--top-p",
         type=float,
-        help="Top-p filtering parameter (outlines only)",
+        help="Top-p filtering parameter (where supported: outlines, sglang)",
+    )
+    analyze_parser.add_argument(
+        "--presence-penalty",
+        type=float,
+        help="Presence penalty (where supported: sglang; approximated for transformers via repetition_penalty)",
+    )
+    analyze_parser.add_argument(
+        "--min-p",
+        dest="min_p",
+        type=float,
+        help="Minimum probability mass threshold (where supported: sglang; approximated for transformers by top_p if top_p not set)",
     )
     analyze_parser.add_argument(
         "--num-train-examples",
@@ -1536,65 +1812,98 @@ def main():
         "results_files", nargs="+", help="Input JSON results files"
     )
     evaluate_parser.add_argument(
-        "--output", "-o", help="Output markdown file (optional)"
+        "--output",
+        "-o",
+        required=True,
+        help="Output filename base (no extension). Writes <base>.md and <base>.png.",
     )
     evaluate_parser.add_argument(
-        "--pdf", help="Output PDF file for alignment visualizations"
+        "--pdf",
+        action="store_true",
+        help="Also export alignment visualizations to <base>.pdf",
+    )
+    evaluate_parser.add_argument(
+        "--html",
+        action="store_true",
+        help="Also export an interactive Altair plot to <base>.html",
     )
 
     args = parser.parse_args()
-    
+
     # Setup logging before anything else
     setup_logging(getattr(args, "verbose", 0))
 
     if args.command == "analyze":
         # Setup random seed for example selection only
-        random.seed(args.seed)
 
         # Create LLM adapter based on type
-        if args.adapter == "litellm":
-            model_params = {
-                "model": args.model,
-                "temperature": args.temperature,
-            }
-            if args.model_seed is not None:
-                model_params["seed"] = args.model_seed
-            llm_adapter: Union[LiteLLMAdapter, OutlinesAdapter, LlamaCppAdapter] = (
-                LiteLLMAdapter(model_params=model_params)
-            )
+        # Create LLM adapter using the package factory
+        backend_map = {
+            "litellm": "litellm",
+            "outlines": "transformers",
+            "llama-cpp": "llama",
+            "sglang": "sglang",
+        }
+        backend = backend_map[args.adapter]
+        spec = f"{backend}:{args.model}" if args.model else backend
+        common_kwargs: dict[str, Any] = {
+            "temperature": args.temperature,
+            "samples": args.samples,
+            "top_k": args.top_k,
+            "top_p": args.top_p,
+            "beam_size": args.beam_size,
+            "max_tokens": args.max_tokens,
+        }
+        if args.adapter == "outlines":
+            # Default max tokens for transformers (keep previous behavior)
+            if common_kwargs["max_tokens"] is None:
+                common_kwargs["max_tokens"] = 4096
+            if args.model_device:
+                common_kwargs["device"] = args.model_device
+            if args.model_dtype:
+                common_kwargs["dtype"] = args.model_dtype
+            if args.model_kwargs:
+                common_kwargs["model_kwargs"] = args.model_kwargs
+            if args.transformers_kwargs:
+                common_kwargs["transformers_kwargs"] = args.transformers_kwargs
+            if args.presence_penalty is not None:
+                common_kwargs["presence_penalty"] = args.presence_penalty
+            if args.min_p is not None:
+                common_kwargs["min_p"] = args.min_p
+        elif args.adapter == "sglang":
+            # Do not force a default max_tokens for sglang
+            if args.sglang_url:
+                common_kwargs["base_url"] = args.sglang_url
+            if args.sglang_api_key:
+                common_kwargs["api_key"] = args.sglang_api_key
+            if args.sglang_client_kwargs:
+                common_kwargs["client_kwargs"] = args.sglang_client_kwargs
+            if args.sglang_generation_kwargs:
+                common_kwargs["generation_kwargs"] = args.sglang_generation_kwargs
+            if args.sglang_extra_body:
+                common_kwargs["extra_body"] = args.sglang_extra_body
+            if args.presence_penalty is not None:
+                common_kwargs["presence_penalty"] = args.presence_penalty
+            if args.min_p is not None:
+                common_kwargs["min_p"] = args.min_p
         elif args.adapter == "llama-cpp":
-            # If use_gpu is specified, override n_gpu_layers to use all layers
-            n_gpu_layers = 99 if args.use_gpu else args.n_gpu_layers
-
-            llm_adapter = LlamaCppAdapter(
-                model_path=args.model,
-                temperature=args.temperature,
-                n_gpu_layers=n_gpu_layers,
-                n_ctx=args.n_ctx,
-                n_batch=args.n_batch,
-                n_threads=args.n_threads,
-                tokenizer_repo_id=args.tokenizer_model,
-                **(args.model_kwargs or {}),
-            )
-        else:  # outlines
-            max_tokens = args.max_tokens if args.max_tokens else 4096
-            logger.info(f"Using max_tokens={max_tokens} for model {args.model}")
-
-            llm_adapter = OutlinesAdapter(
-                model_name=args.model,
-                # Sampling parameters
-                temperature=args.temperature,
-                samples=args.samples,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                beam_size=args.beam_size,
-                max_tokens=max_tokens,
-                # Model configuration
-                device=args.model_device,
-                dtype=args.model_dtype,
-                model_kwargs=args.model_kwargs,
-                **(args.transformers_kwargs or {}),
-            )
+            # Map llama.cpp-related controls
+            if args.use_gpu:
+                common_kwargs["n_gpu_layers"] = -1
+            elif args.n_gpu_layers is not None:
+                common_kwargs["n_gpu_layers"] = args.n_gpu_layers
+            if args.n_ctx:
+                common_kwargs["n_ctx"] = args.n_ctx
+            if args.n_threads:
+                common_kwargs["n_threads"] = args.n_threads
+            # Pass through extra llama kwargs if any
+            if args.model_kwargs:
+                common_kwargs.update(args.model_kwargs)
+            if args.tokenizer_model:
+                common_kwargs["tokenizer_repo_id"] = args.tokenizer_model
+        llm_adapter = create_adapter(
+            spec, **{k: v for k, v in common_kwargs.items() if v is not None}
+        )
 
         lang_pairs = get_language_pairs(args.lang_pairs)
 
@@ -1620,14 +1929,23 @@ def main():
                     training_examples = None
                     if args.num_train_examples is not None:
                         training_examples = load_training_examples(
-                            repo_path, lang_pair, args.num_train_examples
+                            repo_path,
+                            lang_pair,
+                            args.num_train_examples,
+                            seed=args.seed,
                         )
                         logger.info(
                             f"Loaded {len(training_examples)} training examples"
                         )
 
                     metrics, alignments = evaluate_language_pair(
-                        repo_path, lang_pair, llm_adapter, args
+                        repo_path,
+                        lang_pair,
+                        cast(
+                            Union[LiteLLMAdapter, OutlinesAdapter, LlamaCppAdapter],
+                            llm_adapter,
+                        ),
+                        args,
                     )
                     results["language_pairs"][lang_pair] = {
                         "metrics": metrics,
@@ -1680,17 +1998,11 @@ def main():
                                 + count
                             )
 
-                # Merge error type counts
-                for error_type_str, stats in diagnostics[
-                    "validation_error_stats"
-                ].items():
-                    if isinstance(stats, dict):
-                        count = stats.get("count", 0)
-                        if isinstance(count, int):
-                            all_validation_error_types[error_type_str] = (
-                                all_validation_error_types.get(error_type_str, 0)
-                                + count
-                            )
+                # Merge exception types
+                for exc_type, cnt in diagnostics.get("exception_types", {}).items():
+                    all_exception_types[exc_type] = (
+                        all_exception_types.get(exc_type, 0) + cnt
+                    )
 
                 # Print per-language pair results
                 print(f"\n{lang_pair}:")
@@ -1716,11 +2028,14 @@ def main():
             print(f"Total validation errors: {total_validation_errors}")
             print("\nValidation error stats:")
             for error_type, count in sorted(
-                all_validation_error_types.items(),
-                key=lambda x: x[1],
-                reverse=True,
+                all_validation_error_types.items(), key=lambda x: x[1], reverse=True
             ):
-                print(f"  {error_type}: {count}")
+                key = (
+                    error_type.value
+                    if hasattr(error_type, "value")
+                    else str(error_type)
+                )
+                print(f"  {key}: {count}")
             print("\nException types:")
             for exc_type, count in sorted(
                 all_exception_types.items(), key=lambda x: x[1], reverse=True
@@ -1738,24 +2053,19 @@ def main():
         export_results(args.results_file, Path(args.output_dir))
 
     elif args.command == "evaluate":
-        table = evaluate_results(args.results_files, args.output)
-        if args.output:
-            md_path = ensure_extension(args.output, "md")
-            with open(md_path, "w") as f:
-                f.write(table)
+        base = strip_known_output_extension(args.output)
+        html_path = f"{base}.html" if args.html else None
 
-            # Save plot
-            plot_path = ensure_extension(md_path.replace(".md", ""), "png")
-            plt.savefig(plot_path, bbox_inches="tight", dpi=300)
-            plt.close()
-        else:
-            print(table)
+        table = evaluate_results(
+            args.results_files, output_base=base, html_path=html_path
+        )
 
-        # Create visualizations if PDF output is specified
+        md_path = f"{base}.md"
+        with open(md_path, "w") as f:
+            f.write(table)
+
         if args.pdf:
-            create_alignment_visualizations(
-                args.results_files, ensure_extension(args.pdf, "pdf")
-            )
+            create_alignment_visualizations(args.results_files, f"{base}.pdf")
 
 
 if __name__ == "__main__":

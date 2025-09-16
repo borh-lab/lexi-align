@@ -1,5 +1,3 @@
-import os
-
 import pytest
 
 from lexi_align.adapters.llama_cpp_adapter import LlamaCppAdapter, _get_model_files
@@ -41,18 +39,12 @@ def test_split_model_detection():
 
 @pytest.mark.llm
 @pytest.mark.slow
-@pytest.mark.skipif(
-    not os.path.exists("qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf"),
-    reason="Qwen model file not found",
-)
 def test_llama_cpp_alignment():
-    """Test end-to-end alignment with llama.cpp using Qwen model."""
+    """Test end-to-end alignment with llama.cpp using the default model."""
     adapter = LlamaCppAdapter(
-        model_path="qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
-        n_gpu_layers=-1,  # Use all GPU layers
-        n_ctx=2048,  # Specify context window
+        n_gpu_layers=-1,
+        n_ctx=4096,
         n_threads=4,
-        tokenizer_repo_id="Qwen/Qwen2.5-7B-Instruct",
     )
 
     # Test simple English-French alignment with ASCII-only text
@@ -72,14 +64,10 @@ def test_llama_cpp_alignment():
 
     # Basic sanity checks
     assert isinstance(alignment, AlignmentResult)
-    assert alignment.alignment is None or isinstance(alignment.alignment, TextAlignment)
-    if alignment.alignment:
-        assert len(alignment.alignment.alignment) > 0
+    # must always return a TextAlignment with at least one pair
+    assert isinstance(alignment.alignment, TextAlignment), "Expected a TextAlignment"
+    assert alignment.alignment.alignment, "Alignment was empty"
 
     # Check some expected alignments
-    aligned_pairs = (
-        {(a.source, a.target) for a in alignment.alignment.alignment}
-        if alignment.alignment
-        else set()
-    )
+    aligned_pairs = {(a.source, a.target) for a in alignment.alignment.alignment}
     assert ("the", "le") in aligned_pairs or ("cat", "chat") in aligned_pairs

@@ -9,7 +9,7 @@ from lexi_align.core import (
     align_tokens_batched,
     align_tokens_raw,
 )
-from lexi_align.models import TextAlignment, TokenAlignment
+from lexi_align.models import ChatMessageDict, TextAlignment, TokenAlignment
 
 logger = getLogger(__name__)
 
@@ -65,7 +65,7 @@ def test_align_tokens(source, target, source_lang, target_lang, expected, mock_r
     expected_alignment = eval(expected.strip())
 
     class TestMockLLMAdapter(LLMAdapter):
-        def __call__(self, messages: list[dict]) -> TextAlignment:
+        def __call__(self, messages: list[ChatMessageDict]) -> TextAlignment:
             return mock_result
 
     adapter = TestMockLLMAdapter()
@@ -153,7 +153,7 @@ def test_align_tokens_raw(source, target, custom_messages, expected, mock_result
     expected_alignment = eval(expected.strip())
 
     class TestMockLLMAdapter(LLMAdapter):
-        def __call__(self, messages):
+        def __call__(self, messages: list[ChatMessageDict]):
             return mock_result
 
     adapter = TestMockLLMAdapter()
@@ -174,7 +174,7 @@ def test_batch_vs_sequential_alignment():
         def __init__(self):
             self.call_count = 0
 
-        def __call__(self, messages: list[dict]) -> TextAlignment:
+        def __call__(self, messages: list[ChatMessageDict]) -> TextAlignment:
             self.call_count += 1
             # Extract tokens from the last message
             content = messages[-1]["content"]
@@ -195,7 +195,7 @@ def test_batch_vs_sequential_alignment():
             return True
 
         def batch(
-            self, batch_messages: list[list[dict]], max_retries: int = 3
+            self, batch_messages: list[list[ChatMessageDict]], max_retries: int = 3
         ) -> list[Optional[TextAlignment]]:
             return [self(msgs) for msgs in batch_messages]
 
@@ -241,7 +241,7 @@ def test_retry_mechanism():
             self.final_alignment = final_alignment
             self.call_count = 0
 
-        def __call__(self, messages: list[dict]) -> TextAlignment:
+        def __call__(self, messages: list[ChatMessageDict]) -> TextAlignment:
             self.call_count += 1
             if self.call_count <= self.fail_count:
                 raise ValueError(f"Simulated failure #{self.call_count}")
@@ -286,7 +286,7 @@ def test_batch_partial_failures():
             self.success_pattern = success_pattern
             self.current_batch = 0
 
-        def __call__(self, messages: list[dict]) -> TextAlignment:
+        def __call__(self, messages: list[ChatMessageDict]) -> TextAlignment:
             return TextAlignment.from_token_alignments(
                 [TokenAlignment(source="test", target="test")], ["test"], ["test"]
             )
@@ -295,7 +295,7 @@ def test_batch_partial_failures():
             return True
 
         def batch(
-            self, batch_messages: list[list[dict]], max_retries: int = 3
+            self, batch_messages: list[list[ChatMessageDict]], max_retries: int = 3
         ) -> list[Optional[TextAlignment]]:
             results: list[Optional[TextAlignment]] = []
             for i in range(len(batch_messages)):
@@ -336,10 +336,10 @@ def test_batch_partial_failures():
     assert results[1].attempts[-1].validation_passed is False
 
     class ErrorAdapter(LLMAdapter):
-        def __call__(self, messages: list[dict]) -> TextAlignment:
+        def __call__(self, messages: list[ChatMessageDict]) -> TextAlignment:
             raise ValueError("Test error")
 
-        async def acall(self, messages: list[dict]) -> TextAlignment:
+        async def acall(self, messages: list[ChatMessageDict]) -> TextAlignment:
             raise ValueError("Test error")
 
     error_adapter = ErrorAdapter()

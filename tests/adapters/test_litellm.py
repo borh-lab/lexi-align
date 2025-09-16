@@ -71,15 +71,15 @@ def test_litellm_adapter():
 
     # Check if metrics meet minimum thresholds
     min_threshold = 0.25
-    assert (
-        metrics["precision"] >= min_threshold
-    ), f"Precision {metrics['precision']} below threshold {min_threshold}"
-    assert (
-        metrics["recall"] >= min_threshold
-    ), f"Recall {metrics['recall']} below threshold {min_threshold}"
-    assert (
-        metrics["f_measure"] >= min_threshold
-    ), f"F-measure {metrics['f_measure']} below threshold {min_threshold}"
+    assert metrics["precision"] >= min_threshold, (
+        f"Precision {metrics['precision']} below threshold {min_threshold}"
+    )
+    assert metrics["recall"] >= min_threshold, (
+        f"Recall {metrics['recall']} below threshold {min_threshold}"
+    )
+    assert metrics["f_measure"] >= min_threshold, (
+        f"F-measure {metrics['f_measure']} below threshold {min_threshold}"
+    )
 
     # Log the metrics for visibility
     logger.info(f"Alignment metrics: {metrics}")
@@ -142,15 +142,15 @@ async def test_litellm_adapter_async():
 
     # Check if metrics meet minimum thresholds
     min_threshold = 0.25
-    assert (
-        metrics["precision"] >= min_threshold
-    ), f"Precision {metrics['precision']} below threshold {min_threshold}"
-    assert (
-        metrics["recall"] >= min_threshold
-    ), f"Recall {metrics['recall']} below threshold {min_threshold}"
-    assert (
-        metrics["f_measure"] >= min_threshold
-    ), f"F-measure {metrics['f_measure']} below threshold {min_threshold}"
+    assert metrics["precision"] >= min_threshold, (
+        f"Precision {metrics['precision']} below threshold {min_threshold}"
+    )
+    assert metrics["recall"] >= min_threshold, (
+        f"Recall {metrics['recall']} below threshold {min_threshold}"
+    )
+    assert metrics["f_measure"] >= min_threshold, (
+        f"F-measure {metrics['f_measure']} below threshold {min_threshold}"
+    )
 
     # Log the metrics for visibility
     logger.info(f"Alignment metrics: {metrics}")

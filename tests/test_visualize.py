@@ -61,16 +61,15 @@ def test_visualize_alignments_reference_model(sample_tokens, sample_alignments):
 
 
 def test_visualize_alignments_single_model(sample_tokens, sample_alignment):
-    """Test that visualization is skipped for single model"""
+    """Test that visualization works for single model"""
     visualize_alignments(
         source_tokens=sample_tokens["source"],
         target_tokens=sample_tokens["target"],
         alignments={"model1": sample_alignment},
         title="Test Alignment",
     )
-
-    # Check that no figure was created
-    assert not plt.get_fignums(), "Figure was created for single model"
+    # Check that a figure *was* created
+    assert plt.get_fignums(), "No figure was created for single model"
     plt.close()
 
 
