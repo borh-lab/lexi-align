@@ -44,7 +44,8 @@ rocm = [
 ]
 
 [dependency-groups]
-dev-deps = [
+dev = [
+    "mypy>=1.18.1",
     # All extra dependencies for ci and convenience.
     # Note that this will use the normal torch (CUDA on linux).
     "litellm>=1.51.0",
@@ -71,7 +72,10 @@ dev-deps = [
     "loguru>=0.7.2",
     "scipy>=1.14.1",
     # Notebook
-    "marimo[lsp]>=0.13.0"
+    "marimo[lsp]>=0.13.0",
+    "altair>=5.5.0",
+    "polars>=1.33.1",
+    "numba>=0.61.2",
 ]
 
 [tool.uv]
