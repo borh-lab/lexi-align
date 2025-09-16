@@ -1,13 +1,25 @@
-from typing import Optional, Any, Dict, Literal, cast, Union
-from outlines.samplers import Sampler
-import torch
-import json
-import outlines
-from outlines import models, generate
-from transformers import AutoTokenizer, AutoConfig  # type: ignore
-from lexi_align.adapters import LLMAdapter
-from lexi_align.models import TextAlignment
 from logging import getLogger
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Type, cast
+
+if TYPE_CHECKING:
+    from lexi_align.models import ChatMessageDict
+
+import torch
+from outlines import Generator, from_transformers
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer  # type: ignore
+
+from lexi_align.adapters import LLMAdapter
+from lexi_align.models import (
+    TextAlignment,
+    TextAlignmentSchema,
+    TokenAlignment,
+)
+from lexi_align.utils import (
+    extract_existing_alignments_from_messages,
+    extract_tokens_and_retry_flag,
+    select_alignment_schema,
+    to_text_alignment,
+)
 
 logger = getLogger(__name__)
 
@@ -17,7 +29,7 @@ class OutlinesAdapter(LLMAdapter):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
+        model_name: str = "Qwen/Qwen3-0.6B",
         # Sampling parameters
         temperature: float = 0.0,
         samples: int = 1,
@@ -25,11 +37,16 @@ class OutlinesAdapter(LLMAdapter):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         beam_size: Optional[int] = None,
-        max_tokens: int = 2048,
+        max_tokens: int = 4096,
         # Model configuration
         device: Optional[str] = None,
         dtype: Literal["float32", "float16", "bfloat16", "int8", "int4"] = "bfloat16",
         model_kwargs: Optional[Dict[str, Any]] = None,
+        # Optional approximations for sampling
+        presence_penalty: Optional[float] = None,
+        min_p: Optional[float] = None,
+        min_alignments: Optional[int] = 0,
+        json_retry_attempts: int = 3,
         **transformers_kwargs: Any,
     ):
         """Initialize the adapter with an Outlines model.
@@ -45,6 +62,8 @@ class OutlinesAdapter(LLMAdapter):
             device: Device to run model on ('cuda' or 'cpu')
             dtype: Model weight data type
             model_kwargs: Additional kwargs for model initialization
+            presence_penalty: Optional presence penalty (approximated via repetition_penalty)
+            min_p: Optional minimum probability mass threshold (approximated via top_p if not set)
             transformers_kwargs: Additional kwargs for transformers.AutoModelForCausalLM.from_pretrained()
         """
         self.model_name = model_name
@@ -53,6 +72,8 @@ class OutlinesAdapter(LLMAdapter):
         self.model_kwargs = model_kwargs or {}
         self.transformers_kwargs = transformers_kwargs
         self._batch_size = batch_size
+        self.min_alignments = min_alignments or 0
+        self.json_retry_attempts = json_retry_attempts
 
         # Store sampling parameters
         self.samples = samples
@@ -62,6 +83,10 @@ class OutlinesAdapter(LLMAdapter):
         self.top_p = top_p
         self.max_tokens = max_tokens
 
+        # Approximated/optional controls
+        self.presence_penalty: Optional[float] = presence_penalty
+        self.min_p: Optional[float] = min_p
+
         # Initialize tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=True
@@ -69,7 +94,8 @@ class OutlinesAdapter(LLMAdapter):
 
         # Initialize other components lazily
         self._model = None
-        self._generator: Optional[Any] = None
+        self._sampler: Optional[Any] = None
+        self.include_schema = True  # Default to True for local models
 
     def _get_model(self):
         """Initialize model with appropriate configuration."""
@@ -77,92 +103,39 @@ class OutlinesAdapter(LLMAdapter):
 
         logger.info(
             f"Loading model {self.model_name} ({self.dtype}) "
-            f"(Transformers {transformers.__version__} / PyTorch {torch.__version__})"
+            f"(Transformers {transformers.__version__} / PyTorch {torch.__version__}) using device {self.device}"
         )
 
-        config, unused_config = AutoConfig.from_pretrained(
-            self.model_name,
-            trust_remote_code=True,
-            return_unused_kwargs=True,
-        )
-        if unused_config:
-            logger.warning(f"Unused Transformers config keys: {unused_config}")
-
-        # Handle quantization for int8/int4
-        if self.dtype in ["int8", "int4"]:
-            try:
-                from transformers import BitsAndBytesConfig
-
-                logger.info(f"Using BitsAndBytesConfig for {self.dtype} quantization")
-                config.init_device = "meta"
-                quantization_config = BitsAndBytesConfig(
-                    load_in_8bit=(self.dtype == "int8"),
-                    load_in_4bit=(self.dtype == "int4"),
-                )
-                kwargs = {
-                    "config": config,
-                    "trust_remote_code": True,
-                    "torch_dtype": torch.bfloat16,
-                    "device_map": {"": 0},
-                    "quantization_config": quantization_config,
-                }
-                # Only add flash attention if available
-                import importlib.util
-
-                if importlib.util.find_spec("flash_attn"):
-                    kwargs["attn_implementation"] = "flash_attention_2"
-                    logger.info("Using flash attention 2")
-                else:
-                    logger.info(
-                        "Flash attention package not found, using default attention"
-                    )
-
-                return models.transformers(
-                    model_name=self.model_name,
-                    device="cuda",
-                    model_kwargs=kwargs,
-                )
-            except ImportError as e:
-                logger.info(
-                    f"BitsAndBytesConfig not available, falling back to bfloat16: {e}"
-                )
-
-        # Handle other dtype options
-        dtype_map = {
+        torch_dtype = {
             "float32": torch.float32,
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
-        }
-        torch_dtype = dtype_map.get(self.dtype, torch.bfloat16)
+            "int8": torch.float16,  # fallback dtype for quantized wrappers
+            "int4": torch.float16,  # fallback dtype for quantized wrappers
+        }.get(self.dtype, torch.float32)
 
-        kwargs = {
-            "config": config,
-            "trust_remote_code": True,
-            "torch_dtype": torch_dtype,
-        }
-
-        # Only add flash attention if on CUDA and available
+        config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+        # Merge kwargs for model loading (model_kwargs + transformers_kwargs)
+        load_kwargs: Dict[str, Any] = dict(self.model_kwargs or {})
+        load_kwargs.update(self.transformers_kwargs)
+        # Ensure dtype is honored (Transformers recent versions accept 'dtype')
+        load_kwargs.setdefault("dtype", torch_dtype)
+        # If CUDA requested, set sane defaults unless user provided them
         if self.device == "cuda":
-            import importlib.util
+            load_kwargs.setdefault("device_map", "auto")
+            load_kwargs.setdefault("low_cpu_mem_usage", True)
 
-            if importlib.util.find_spec("flash_attn"):
-                kwargs["attn_implementation"] = "flash_attention_2"
-                logger.info("Using flash attention 2")
-            else:
-                logger.info(
-                    "Flash attention package not found, using default attention"
-                )
-
-        # Add any additional model kwargs
-        kwargs.update(self.model_kwargs)
-
-        model = models.transformers(
+        hf_model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            device=self.device,
-            model_kwargs=kwargs,
+            config=config,
+            trust_remote_code=True,
+            **load_kwargs,
         )
-        logger.debug(f"Model: {model} with config {config}")
-        return model
+        # If no device_map was used, explicitly move to a single CUDA device
+        if self.device == "cuda" and "device_map" not in load_kwargs:
+            hf_model = hf_model.to("cuda")
+
+        return cast(Any, from_transformers)(cast(Any, hf_model), self.tokenizer)
 
     @property
     def model(self):
@@ -172,116 +145,219 @@ class OutlinesAdapter(LLMAdapter):
         return self._model
 
     @property
-    def generator(self) -> Any:
-        """Lazy initialization of the generator with appropriate sampler."""
-        if self._generator is None:
-            # Choose sampler based on parameters
-            sampler: Sampler
-            if self.beam_size is not None:
-                sampler = cast(
-                    Sampler, outlines.samplers.beam_search(beams=self.beam_size)
-                )
-            elif self.temperature == 0.0:
-                sampler = cast(Sampler, outlines.samplers.greedy())
-            else:
-                sampler = cast(
-                    Sampler,
-                    outlines.samplers.multinomial(
-                        self.samples,
-                        temperature=self.temperature,
-                        top_k=self.top_k,
-                        top_p=self.top_p,
-                    ),
-                )
+    def sampler(self) -> Any:
+        """Lazy initialization of the sampler."""
+        # Deprecated: outlines.samplers and Sampler are no longer used in v1 API.
+        # This property is retained for backward compatibility but will always return None.
+        return None
 
-            self._generator = generate.json(
-                self.model,
-                TextAlignment,
-                sampler=sampler,
+    def _inference_kwargs(self) -> Dict[str, Any]:
+        """Map adapter sampling params to HF/generator kwargs; approximate unsupported ones."""
+        kwargs: Dict[str, Any] = {}
+
+        # Beam search vs sampling
+        if self.beam_size is not None:
+            kwargs["num_beams"] = self.beam_size
+            kwargs["do_sample"] = False
+        else:
+            # Enable sampling when temperature > 0
+            kwargs["do_sample"] = bool(self.temperature and self.temperature > 0)
+
+        # Common sampling params
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        if self.top_k is not None:
+            kwargs["top_k"] = self.top_k
+        if self.top_p is not None:
+            kwargs["top_p"] = self.top_p
+
+        # Approximate min_p via top_p if top_p not explicitly set
+        if getattr(self, "min_p", None) is not None and "top_p" not in kwargs:
+            kwargs["top_p"] = self.min_p
+            logger.warning(
+                "OutlinesAdapter: approximating min_p via top_p=%s", self.min_p
             )
-        assert self._generator is not None
-        return self._generator
+
+        # Approximate presence_penalty via repetition_penalty (safe non-negative transform)
+        if getattr(self, "presence_penalty", None) is not None:
+            pp = self.presence_penalty
+            rep = max(0.0, 1.0 + float(pp)) if pp is not None else 1.0
+            kwargs["repetition_penalty"] = rep
+            logger.warning(
+                "OutlinesAdapter: approximating presence_penalty via repetition_penalty=%s",
+                rep,
+            )
+
+        return kwargs
+
+    def _get_schema_class(
+        self,
+        source_tokens: list[str],
+        target_tokens: list[str],
+        is_retry: bool = False,
+        existing_alignments: Optional[List[TokenAlignment]] = None,
+    ) -> Type[TextAlignmentSchema]:
+        """Get appropriate schema class with length constraints."""
+        return select_alignment_schema(
+            source_tokens,
+            target_tokens,
+            min_alignments=self.min_alignments or 0,
+            is_retry=is_retry,
+            existing_alignments=existing_alignments,
+        )
 
     def batch(
         self,
-        batch_messages: list[list[dict]],
+        batch_messages: list[list["ChatMessageDict"]],
         max_retries: int = 3,
     ) -> list[Optional[TextAlignment]]:
-        """Generate alignments for a batch of message sequences.
+        """Generate alignments for a batch of message sequences."""
+        try:
+            # Format all prompts and create schemas
+            prompts: list[str] = []
+            schema_classes: list[Type[TextAlignmentSchema]] = []
 
-        Args:
-            batch_messages: List of message sequences to process
-            max_retries: Maximum number of retries per sequence
+            for messages in batch_messages:
+                try:
+                    source_tokens, target_tokens, is_retry = (
+                        extract_tokens_and_retry_flag(
+                            cast(List[Dict[str, Any]], messages)
+                        )
+                    )
 
-        Returns:
-            List of TextAlignment objects or None for failed generations
-        """
-        results: list[Optional[TextAlignment]] = []
+                    # Extract existing alignments if this is a retry
+                    existing_alignments = None
+                    existing_alignments = extract_existing_alignments_from_messages(
+                        cast(List[Dict[str, Any]], messages)
+                    )
 
-        # Format all prompts at once
-        prompts = [
-            self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False
-            )
-            for messages in batch_messages
-        ]
+                    schema_class = self._get_schema_class(
+                        source_tokens, target_tokens, is_retry, existing_alignments
+                    )
+                except ValueError:
+                    logger.warning(f"Could not find tokens in messages: {messages}")
+                    schema_class = TextAlignmentSchema
 
-        success = False
-        last_error: Optional[Union[json.JSONDecodeError, Exception]] = None
+                schema_classes.append(schema_class)
 
-        # Try up to max_retries times for the entire batch
-        for attempt in range(max_retries):
-            try:
-                # Process all prompts in a single generator call
-                batch_results = self.generator(
-                    prompts,
-                    max_tokens=self.max_tokens,
+                # Format prompt
+                prompt = self.tokenizer.apply_chat_template(
+                    cast(List[Dict[str, Any]], messages),
+                    add_generation_prompt=True,
+                    tokenize=False,
                 )
-                # batch_results should be a list of TextAlignment objects
-                results = [cast(TextAlignment, result) for result in batch_results]
-                success = True
-                break
+                prompts.append(prompt)
 
-            except json.JSONDecodeError as e:
-                context = e.doc[max(0, e.pos - 50) : min(len(e.doc), e.pos + 50)]
-                logger.warning(
-                    f"JSON decode error near position {e.pos}. Context: '...{context}...'\n"
-                    "Increasing max_tokens and retrying..."
-                )
-                self.max_tokens *= 2  # Double max_tokens on JSON errors
-                last_error = e
+            # Process prompts with their corresponding schemas
+            batch_results: list[Optional[TextAlignment]] = []
+            for i, (prompt, schema_class) in enumerate(zip(prompts, schema_classes)):
+                try:
+                    gen = Generator(self.model, schema_class)
+                    result = gen(
+                        prompt,
+                        max_new_tokens=self.max_tokens,
+                        **self._inference_kwargs(),
+                    )
+                    ta = to_text_alignment(result)
+                    if ta.alignment:
+                        batch_results.append(ta)
+                    else:
+                        logger.error("Received empty alignment from OutlinesAdapter")
+                        batch_results.append(None)
+                except Exception as e:
+                    logger.error(
+                        f"Error processing prompt {i}:\n"
+                        f"Error type: {type(e).__name__}\n"
+                        f"Error message: {str(e)}\n"
+                        f"Stack trace:",
+                        exc_info=True,
+                    )
+                    batch_results.append(None)
 
-            except Exception as e:
-                logger.warning(
-                    f"Attempt {attempt + 1} failed ({type(e).__name__}): {str(e)}"
-                )
-                last_error = e
+            return batch_results
 
-        if not success:
+        except Exception as e:
             logger.error(
-                f"All attempts failed for batch. Last error: {str(last_error)}"
+                f"Batch processing failed:\n"
+                f"Error type: {type(e).__name__}\n"
+                f"Error message: {str(e)}\n"
+                f"Number of messages in batch: {len(batch_messages)}\n"
+                f"Prompts: {prompts}\n"
+                f"Stack trace:",
+                exc_info=True,
             )
-            # Return None for each sequence in the batch
-            results = [None] * len(batch_messages)
-
-        return results
+            return [None] * len(batch_messages)
 
     def supports_true_batching(self) -> bool:
         """Indicate that this adapter supports efficient batching."""
         return True
 
-    def __call__(self, messages: list[dict]) -> TextAlignment:
+    def supports_length_constraints(self) -> bool:
+        """Indicate that this adapter supports alignment length constraints."""
+        return True
+
+    def __call__(self, messages: list["ChatMessageDict"]) -> TextAlignment:
         """Generate alignments using the Outlines model."""
-        # Apply chat template to convert messages to the model's expected format
+        source_tokens, target_tokens, is_retry = extract_tokens_and_retry_flag(
+            cast(List[Dict[str, Any]], messages)
+        )
+
+        # Extract existing alignments if this is a retry
+        existing_alignments = extract_existing_alignments_from_messages(
+            cast(List[Dict[str, Any]], messages)
+        )
+
         prompt = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False
+            cast(List[Dict[str, Any]], messages),
+            add_generation_prompt=True,
+            tokenize=False,
         )
-        logger.debug(f"Formatted prompt: {prompt}")
+        logger.debug(f"# Formatted prompt: {prompt}")
 
-        # Use cached generator
-        result = self.generator(
-            prompt,
-            max_tokens=self.max_tokens,
+        schema_class = self._get_schema_class(
+            source_tokens, target_tokens, is_retry, existing_alignments
         )
+        logger.debug(f"# Schema class: {schema_class}")
 
-        return cast(TextAlignment, result)
+        def _gen(seed: Optional[int]) -> TextAlignment:
+            cpu_state = None
+            cuda_states = None
+            try:
+                if seed is not None:
+                    import torch as _torch
+
+                    cpu_state = _torch.random.get_rng_state()
+                    cuda_states = (
+                        _torch.cuda.get_rng_state_all()
+                        if _torch.cuda.is_available()
+                        else None
+                    )
+                    _torch.manual_seed(seed)
+                    if _torch.cuda.is_available():
+                        _torch.cuda.manual_seed_all(seed)
+
+                gen = Generator(self.model, schema_class)
+                result = gen(
+                    prompt,
+                    max_new_tokens=self.max_tokens,
+                    **self._inference_kwargs(),
+                )
+                return to_text_alignment(result)
+            finally:
+                if seed is not None:
+                    import torch as _torch
+
+                    if cpu_state is not None:
+                        _torch.random.set_rng_state(cpu_state)
+                    if cuda_states is not None:
+                        _torch.cuda.set_rng_state_all(cuda_states)
+
+        ta = self._retry_on_invalid_json(
+            _gen,
+            max_retries=self.json_retry_attempts,
+            base_seed=0,
+        )
+        if not ta.alignment:
+            logger.error("Received empty alignment from OutlinesAdapter")
+            raise ValueError("Empty TextAlignment from OutlinesAdapter")
+        return ta

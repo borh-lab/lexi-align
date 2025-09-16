@@ -65,7 +65,7 @@ from lexi_align.core import align_tokens
 
 # Initialize the LLM adapter
 llm_adapter = LiteLLMAdapter(model_params={
-    "model": "gpt-4o",
+    "model": "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
     "temperature": 0.0
 })
 
@@ -85,9 +85,12 @@ result = align_tokens(
 if result.alignment:
     print("Successful alignment:")
     for align in result.alignment.alignment:
-        print(f"{align.source_token} -> {align.target_token}")
+        print(f"{align.source} -> {align.target}")
+else:
+    print("Alignment failed. Check result.attempts for details.")
 
-# Example output will show the uniquified tokens:
+# Example output (will vary based on model and input):
+# Successful alignment:
 # the₁ -> le₁
 # big -> gros
 # cat₁ -> chat₁
@@ -144,6 +147,8 @@ for result in results:
 
 ### Async Processing
 
+**EXPERIMENTAL**
+
 For asynchronous processing:
 
 ```python
@@ -172,6 +177,14 @@ async def align_async():
 
 # Run async alignment
 result = asyncio.run(align_async())
+
+# Access the alignment result (similar to sync version)
+if result.alignment:
+    print("Successful async alignment:")
+    for align in result.alignment.alignment:
+        print(f"{align.source} -> {align.target}")
+else:
+    print("Async alignment failed. Check result.attempts for details.")
 ```
 
 ### Diagnostic Information
@@ -201,6 +214,9 @@ for attempt in result.attempts:
     if attempt.exception:
         print("Exception:", attempt.exception)
 ```
+
+Note that `AlignmentResult` is returned even if the alignment failed (due to external or internal factors).
+Use the above code as a guide to examine the errors.
 
 ### Using Custom Guidelines and Examples
 
@@ -232,8 +248,8 @@ examples = [
         "Le chat".split(),  # target tokens
         TextAlignment(      # gold alignment
             alignment=[
-                TokenAlignment(source_token="The", target_token="Le"),
-                TokenAlignment(source_token="cat", target_token="chat"),
+                TokenAlignment(source="The", target="Le"),
+                TokenAlignment(source="cat", target="chat"),
             ]
         )
     ),
@@ -303,29 +319,70 @@ unique_tokens = make_unique(tokens, marker_gen)
 print(unique_tokens)  # ['the_1', 'cat', 'the_2', 'mat']
 ```
 
-### Using Local Models with Outlines
+### Dynamic Schema Generation
 
-For running local models, you can use the Outlines adapter:
+The library supports dynamic JSON schema generation and uses it both as an enforcement mechanism and as explicit prompt guidance. Adapters that can pass a schema to the backend/generator (Outlines, SGLang, LlamaCpp via Outlines integration) use a dynamic schema to enforce token enums and alignment-length constraints server-side. Remote/backends that cannot enforce schemas themselves (e.g., litellm) can optionally request schema-validated responses by enabling use_dynamic_schema=True (pass use_dynamic_schema to create_adapter or instantiate LiteLLMAdapter with use_dynamic_schema=True). Additionally, some adapters (LiteLLMAdapter and SGLangAdapter) embed the schema JSON in the system prompt by default (include_schema=True) so the model receives explicit, machine-readable guidance even when the API cannot validate responses.
 
 ```python
 from lexi_align.adapters.outlines_adapter import OutlinesAdapter
 from lexi_align.core import align_tokens
 
-# Initialize the Outlines adapter with a local model
+# Initialize adapter - supports dynamic schema by default
 llm_adapter = OutlinesAdapter(
-    model_name="Qwen/Qwen2.5-1.5B-Instruct",  # or any local model path
-    dtype="bfloat16",  # optional: choose quantization
-    device="cuda"      # optional: specify device
+    model_name="Qwen/Qwen2.5-1.5B-Instruct",
+    dtype="bfloat16",
+    device="cuda",
+    batch_size=5  # Enable efficient batching
 )
 
-# Use the same API as with other adapters
-alignment = align_tokens(
+# The library automatically:
+# 1. Generates a schema specific to your token sets
+# 2. Validates token existence and uniqueness
+# 3. Enforces alignment length constraints
+# 4. Provides detailed error messages for invalid alignments
+
+result = align_tokens(
     llm_adapter,
     source_tokens,
     target_tokens,
     source_language="English",
     target_language="French"
 )
+
+# Check validation results
+if result.alignment:
+    print("Valid alignment achieved")
+else:
+    for attempt in result.attempts:
+        if attempt.validation_errors:
+            print(f"Attempt {attempt.attempt_number} errors:")
+            for error_type, msg, tokens in attempt.validation_errors:
+                print(f"- {error_type}: {msg}")
+```
+
+The dynamic schema:
+- Ensures tokens exist in the source/target sets
+- Handles repeated tokens with unique markers
+- Sets minimum/maximum alignment lengths
+- Provides clear error messages for invalid alignments
+- Supports partial alignments with retries
+
+### Logging
+
+The library uses Python's standard `logging` module. To see detailed logs, including debug messages, configure the logger for the `lexi_align` namespace:
+
+```python
+import logging
+
+# Configure basic logging (e.g., to console)
+logging.basicConfig(level=logging.INFO) # Set your desired overall level
+
+# Enable DEBUG level specifically for lexi-align
+logging.getLogger("lexi_align").setLevel(logging.DEBUG)
+
+# Now import and use lexi-align
+from lexi_align.core import align_tokens
+# ... rest of your code
 ```
 
 ### Using Local Models with llama.cpp
@@ -358,7 +415,7 @@ alignment = align_tokens(
 
 ### Performance
 
-Here are some preliminary results on the test EN-SL subset of XL-WA (using the older 0.1.0 version):
+Here are some preliminary results on the test EN-SL subset of XL-WA (obtained with library version 0.1.0):
 
 #### gpt-4o-2024-08-06 (1shot) (seed=42)
 
@@ -435,10 +492,21 @@ python evaluations/xl-wa.py --lang-pairs EN-SL
 # Evaluate on all language pairs
 python evaluations/xl-wa.py --lang-pairs all
 
-# Full evaluation with custom parameters
+# Full evaluation with custom parameters using an API model
 python evaluations/xl-wa.py \
     --lang-pairs EN-FR EN-DE \
-    --model gpt-4o \
+    --model litellm:openai/gpt-5-mini \
+    --async \
+    --temperature 0.1 \
+    --seed 42 \
+    --model-seed 42 \
+    --num-train-examples 3 \
+    --output results.json
+
+# Full evaluation with custom parameters using a local Transformers model
+python evaluations/xl-wa.py \
+    --lang-pairs EN-FR EN-DE \
+    --model transformers:Qwen3-0.6B \
     --temperature 0.0 \
     --seed 42 \
     --num-train-examples 3 \
@@ -459,7 +527,20 @@ Available command-line arguments:
 
 ## Changelog
 
-### v0.3.0 (2024-03-11)
+### v0.4.0 (September 2025)
+
+Key highlights:
+
+- New SGLang adapter: an Outlines-backed adapter using OpenAI-compatible SGLang servers (sync/async and batch (which is just async) support).
+- Dynamic schema: dynamic JSON schemas are used for enforcement where supported (Outlines, SGLang, LlamaCpp). LiteLLMAdapter can optionally request schema-validated responses via use_dynamic_schema=True and (like SGLangAdapter) embeds the schema JSON in the system prompt by default (include_schema=True).
+- Batching & retry robustness: align_tokens_batched now maintains per-sequence message histories, supports partial retries/fallbacks, and uses an adapter.batch() interface for true batched backends.
+- LlamaCppAdapter: improved Outlines integration, split-model detection/tokenizer handling, max_tokens/seed/json-retry controls and a deterministic heuristic fallback.
+- LLMAdapter base/API refinements: async fallback (acall runs sync call in a thread), a default batch() implementation (adapters may override), and improved JSON-retry detection/logging (_is_json_invalid_error and _retry_on_invalid_json/_async variants).
+- Validation & diagnostics: better handling of explicit <unaligned> entries, richer AlignmentAttempt/AlignmentResult diagnostics, and helpers for categorizing/normalizing validation errors (categorize_validation_errors, summarize_result).
+- API note: TokenAlignment/TextAlignment field naming and validators have been tightened — use TokenAlignment(source=..., target=...) in examples (source_token/target_token names are no longer used).
+- Visualization & utilities: improved matplotlib/Altair visualizations (dynamic sizing and HTML export) and utility improvements (TokenMapping position handling, normalize/remove-unique helpers, Pharaoh format round‑trip verification).
+
+### v0.3.0 (March 2024)
 - Added support for batched processing with `align_tokens_batched`
 - Added async support via `align_tokens_async`
 - Added enhanced diagnostics and error reporting
