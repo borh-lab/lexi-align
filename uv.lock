@@ -1212,15 +1212,6 @@ wheels = [
 ]
 
 [[package]]
-name = "japanize-matplotlib"
-version = "1.1.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "matplotlib" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/aa/85/08a4b7fe8987582d99d9bb7ad0ff1ec75439359a7f9690a0dbf2dbf98b15/japanize-matplotlib-1.1.3.tar.gz", hash = "sha256:e89e7d9e109820962650e59a130403b59b33915fde3871a265a5891d9bf5e079", size = 4118887, upload-time = "2020-10-21T10:20:37.049Z" }
-
-[[package]]
 name = "jedi"
 version = "0.19.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1508,7 +1499,7 @@ wheels = [
 
 [[package]]
 name = "lexi-align"
-version = "0.4.2"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "llm-schema-lite" },
@@ -1546,7 +1537,6 @@ rocm = [
 ]
 viz = [
     { name = "altair" },
-    { name = "japanize-matplotlib" },
     { name = "matplotlib" },
     { name = "polars" },
     { name = "pyfonts" },
@@ -1570,6 +1560,7 @@ dev = [
     { name = "pandas" },
     { name = "pandas-stubs" },
     { name = "polars" },
+    { name = "pyfonts" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-mock" },
@@ -1589,7 +1580,6 @@ requires-dist = [
     { name = "bitsandbytes", marker = "extra == 'cuda'" },
     { name = "datasets", marker = "extra == 'outlines'", specifier = ">=3.2.0" },
     { name = "flash-attn", marker = "extra == 'cuda'" },
-    { name = "japanize-matplotlib", marker = "extra == 'viz'", specifier = ">=1.1.3" },
     { name = "litellm", marker = "extra == 'litellm'", specifier = ">=1.51.0" },
     { name = "llama-cpp-python", marker = "extra == 'llama-cpp'", specifier = ">=0.3.6" },
     { name = "llm-schema-lite", specifier = ">=0.6.1" },
@@ -1629,6 +1619,7 @@ dev = [
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "pandas-stubs" },
     { name = "polars", specifier = ">=1.33.1" },
+    { name = "pyfonts", specifier = ">=1.1.3" },
     { name = "pytest", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "pytest-mock", specifier = ">=3.12.0" },

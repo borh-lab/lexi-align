@@ -10,7 +10,6 @@ import seaborn as sns  # type: ignore
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 
-# import japanize_matplotlib  # noqa: F401
 from pyfonts import load_google_font, set_default_font  # type: ignore[import-untyped]
 
 from lexi_align.models import TextAlignment
