@@ -11,11 +11,9 @@ from typing import Any, Optional, cast
 import litellm
 
 from lexi_align.adapters.base import LLMAdapter
-from lexi_align.models import ChatMessageDict, TextAlignment, TextAlignmentSchema
+from lexi_align.models import ChatMessageDict, TextAlignment
 from lexi_align.utils import (
-    extract_existing_alignments_from_messages,
-    extract_tokens_and_retry_flag,
-    select_alignment_schema,
+    to_text_alignment,
 )
 
 logger = getLogger(__name__)
@@ -29,42 +27,32 @@ class LiteLLMAdapter(LLMAdapter):
         model_params: Optional[dict[str, Any]] = None,
         use_dynamic_schema: bool = False,
         min_alignments: int = 0,
+        use_reasoning: bool = False,
     ):
         """Initialize the adapter with model parameters."""
         self.model_params = model_params or {}
-        self.use_dynamic_schema = bool(use_dynamic_schema)
-        self.min_alignments = int(min_alignments or 0)
+
+        # Set default timeout to 15 minutes if not specified
+        if "timeout" not in self.model_params:
+            self.model_params["timeout"] = 900.0  # 15 minutes
+
+        self._init_common_params(
+            min_alignments,
+            use_dynamic_schema,
+            json_retry_attempts=3,
+            use_reasoning=use_reasoning,
+        )
         # Always include the schema in prompts for parity with other adapters
         self.include_schema = True
-        self.json_retry_attempts = 3
 
     def supports_length_constraints(self) -> bool:
         return self.use_dynamic_schema
-
-    def _select_response_schema(
-        self, messages: list[ChatMessageDict]
-    ) -> type[TextAlignmentSchema]:
-        if not self.use_dynamic_schema:
-            return TextAlignmentSchema
-        src_tokens, tgt_tokens, is_retry = extract_tokens_and_retry_flag(
-            cast(list[dict], messages)
-        )
-        existing_aligns = extract_existing_alignments_from_messages(
-            cast(list[dict], messages)
-        )
-        return select_alignment_schema(
-            src_tokens,
-            tgt_tokens,
-            min_alignments=self.min_alignments,
-            is_retry=is_retry,
-            existing_alignments=existing_aligns,
-        )
 
     async def acall(self, messages: list[ChatMessageDict]) -> TextAlignment:
         """Async version using acompletion with JSON-retry wrappers."""
         base_seed = int(self.model_params.get("seed", 0) or 0)
 
-        schema_for_response = self._select_response_schema(messages)
+        schema_for_response = self._select_schema_for_messages(messages)
 
         async def _agen(seed: Optional[int]) -> TextAlignment:
             params = dict(self.model_params)
@@ -76,7 +64,9 @@ class LiteLLMAdapter(LLMAdapter):
                 **params,
             )
             content = response.choices[0].message.content
-            return TextAlignment.model_validate_json(content)
+            content = content.strip() if isinstance(content, str) else str(content)
+            schema_obj = schema_for_response.model_validate_json(content, strict=True)
+            return to_text_alignment(schema_obj)
 
         return await self._retry_on_invalid_json_async(
             _agen,
@@ -88,7 +78,7 @@ class LiteLLMAdapter(LLMAdapter):
         """Synchronous version using completion with JSON-retry wrappers."""
         base_seed = int(self.model_params.get("seed", 0) or 0)
 
-        schema_for_response = self._select_response_schema(messages)
+        schema_for_response = self._select_schema_for_messages(messages)
 
         def _gen(seed: Optional[int]) -> TextAlignment:
             params = dict(self.model_params)
@@ -100,7 +90,9 @@ class LiteLLMAdapter(LLMAdapter):
                 **params,
             )
             content = response.choices[0].message.content
-            return TextAlignment.model_validate_json(content)
+            content = content.strip() if isinstance(content, str) else str(content)
+            schema_obj = schema_for_response.model_validate_json(content, strict=True)
+            return to_text_alignment(schema_obj)
 
         return self._retry_on_invalid_json(
             _gen,

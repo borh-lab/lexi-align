@@ -1,6 +1,6 @@
 import re
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from lexi_align.models import ChatMessageDict
@@ -10,14 +10,8 @@ from llama_cpp import Llama
 from lexi_align.adapters import LLMAdapter
 from lexi_align.models import (
     TextAlignment,
-    TokenAlignment,
 )
-from lexi_align.utils import (
-    extract_existing_alignments_from_messages,
-    extract_tokens_and_retry_flag,
-    select_alignment_schema,
-    to_text_alignment,
-)
+from lexi_align.utils import to_text_alignment
 
 logger = getLogger(__name__)
 
@@ -65,9 +59,11 @@ class LlamaCppAdapter(LLMAdapter):
         verbose: bool = False,
         repo_id: Optional[str] = "unsloth/gemma-3n-E2B-it-GGUF",
         enforce_length_constraints: bool = False,
-        max_tokens: int = 4096,  # NEW
+        max_tokens: int = 4096,
         min_alignments: Optional[int] = 0,
         json_retry_attempts: int = 3,
+        use_dynamic_schema: bool = True,
+        use_reasoning: bool = False,
         **kwargs: Any,
     ):
         """Initialize the adapter with a llama.cpp model.
@@ -83,6 +79,7 @@ class LlamaCppAdapter(LLMAdapter):
             verbose: Print verbose output
             repo_id: Hugging Face repo ID (default: "unsloth/gemma-3n-E2B-it-GGUF")
             max_tokens: Maximum number of new tokens to generate (passed to the Outlines generator)
+            use_reasoning: Whether to include reasoning field in responses
             **kwargs: Additional kwargs passed to Llama
         """
         self.model_path = model_path
@@ -95,13 +92,14 @@ class LlamaCppAdapter(LLMAdapter):
         self.verbose = verbose
         self.repo_id = repo_id
         self.kwargs = kwargs
-        self.max_tokens = max_tokens  # NEW
-        self.min_alignments = min_alignments or 0
+        self.max_tokens = max_tokens
+        self._init_common_params(
+            min_alignments, use_dynamic_schema, json_retry_attempts, use_reasoning
+        )
 
         # Initialize components lazily
         self._model: Optional[Llama] = None
         self.include_schema = True  # Default to True for local models
-        self.json_retry_attempts = json_retry_attempts
 
     @property
     def model(self) -> Llama:
@@ -162,7 +160,7 @@ class LlamaCppAdapter(LLMAdapter):
 
     def supports_length_constraints(self) -> bool:
         """Indicate that this adapter supports alignment length constraints."""
-        return True
+        return self.use_dynamic_schema
 
     def __call__(self, messages: list["ChatMessageDict"]) -> TextAlignment:
         """Generate alignments using the llama.cpp model."""
@@ -178,19 +176,7 @@ class LlamaCppAdapter(LLMAdapter):
                 from outlines import Generator, from_llamacpp
 
                 outlines_model = from_llamacpp(self.model)
-                src_tokens, tgt_tokens, is_retry = extract_tokens_and_retry_flag(
-                    cast(List[Dict[str, Any]], messages)
-                )
-                existing_alignments = extract_existing_alignments_from_messages(
-                    cast(List[Dict[str, Any]], messages)
-                )
-                dyn_schema = select_alignment_schema(
-                    src_tokens,
-                    tgt_tokens,
-                    min_alignments=self.min_alignments or 0,
-                    is_retry=is_retry,
-                    existing_alignments=existing_alignments,
-                )
+                schema_class = self._select_schema_for_messages(messages)
 
                 # Try to set seed deterministically when provided
                 if seed is not None:
@@ -200,13 +186,14 @@ class LlamaCppAdapter(LLMAdapter):
                     except Exception:
                         pass
 
-                generator = Generator(outlines_model, dyn_schema)
-                gen_kwargs: Dict[str, Any] = {"max_tokens": self.max_tokens}
+                generator = Generator(outlines_model, schema_class)
+                call_args: Dict[str, Any] = {"max_tokens": self.max_tokens}
                 if seed is not None:
-                    gen_kwargs["seed"] = (
+                    call_args["seed"] = (
                         seed  # accepted by some backends; harmless otherwise
                     )
-                out = generator(prompt, **gen_kwargs)
+                logger.debug(call_args)
+                out = generator(prompt, **call_args)
                 return to_text_alignment(out)
 
             return self._retry_on_invalid_json(
@@ -215,21 +202,5 @@ class LlamaCppAdapter(LLMAdapter):
                 base_seed=base_seed,
             )
         except Exception as e:
-            # Original heuristic fallback preserved
-            logger.warning(
-                f"LlamaCppAdapter generation failed, using heuristic fallback: {e}"
-            )
-            try:
-                src_tokens, tgt_tokens, _ = extract_tokens_and_retry_flag(
-                    cast(List[Dict[str, Any]], messages)
-                )
-                pairs = [
-                    TokenAlignment(source=s, target=t)
-                    for s, t in zip(src_tokens, tgt_tokens)
-                ]
-                return TextAlignment.from_token_alignments(
-                    pairs, src_tokens, tgt_tokens, adapter=self
-                )
-            except Exception as e2:
-                logger.error(f"Fallback alignment failed: {e2}")
-                raise e
+            logger.error(f"LlamaCppAdapter generation failed: {e}")
+            raise

@@ -1,4 +1,4 @@
-import json
+from asyncio import run as asyncio_run
 from logging import getLogger
 from typing import (
     Any,
@@ -11,9 +11,20 @@ from typing import (
     TypedDict,
 )
 
+from llm_schema_lite import simplify_schema
+from tqdm import tqdm
+
 from lexi_align.adapters import LLMAdapter
-from lexi_align.models import (
+from lexi_align.constants import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_CONCURRENCY,
+    REMAINING_SOURCE_PREFIX,
+    REMAINING_TARGET_PREFIX,
+    SOURCE_TOKENS_PREFIX,
+    TARGET_TOKENS_PREFIX,
     UNALIGNED_MARKER,
+)
+from lexi_align.models import (
     AlignmentAttempt,
     AlignmentResult,
     SpecialTokens,
@@ -34,8 +45,8 @@ from lexi_align.utils import (
     create_token_mapping,
     format_messages,
     make_unique,
-    to_text_alignment,
 )
+from lexi_align.utils.common import batch_iterable, ensure_text_alignment
 
 logger = getLogger(__name__)
 
@@ -142,7 +153,6 @@ def _validate_alignment(
 ]:
     """
     Validate alignment and extract valid alignments and remaining tokens.
-    Now handles explicit unaligned tokens and improved error reporting.
     Returns tuple of:
     - is_valid: bool
     - errors: list of (error_type, description, affected_tokens)
@@ -156,42 +166,21 @@ def _validate_alignment(
         target_mapping = create_token_mapping(target_tokens, marker_generator)
 
     valid_alignments = list(existing_alignments) if existing_alignments else []
-    errors: list[tuple[ValidationErrorType, str, list[str]]] = []
-
-    # Get special tokens for validation
-    special_tokens = {
-        SpecialTokens.UNALIGNED.value,
-        # SpecialTokens.SOURCE_SPECIFIC.value,
-        # SpecialTokens.TARGET_SPECIFIC.value
-    }
-
-    # Track explicitly unaligned tokens
+    errors: List[Tuple[ValidationErrorType, str, List[str]]] = []
     explicitly_unaligned_source = set()
     explicitly_unaligned_target = set()
+    invalid_source: List[str] = []
+    invalid_target: List[str] = []
 
-    # Track invalid tokens with improved handling
-    invalid_source: list[str] = []
-    invalid_target: list[str] = []
+    special_tokens = {
+        SpecialTokens.UNALIGNED.value,
+        SpecialTokens.SOURCE_SPECIFIC.value,
+        SpecialTokens.TARGET_SPECIFIC.value,
+    }
 
-    # Validate each alignment pair
+    # Process all alignments in one pass
     for align in alignment.alignment:
-        # Skip empty or whitespace-only tokens
-        if not align.source or not align.source.strip():
-            invalid_source.append("<empty>")
-            continue
-        if not align.target or not align.target.strip():
-            invalid_target.append("<empty>")
-            continue
-
-        # Check for multi-token strings
-        if len(align.source.split()) > 1:
-            invalid_source.append(repr(align.source))
-            continue
-        if len(align.target.split()) > 1:
-            invalid_target.append(repr(align.target))
-            continue
-
-        # Handle special token alignments
+        # Handle special alignments
         if align.source in special_tokens or align.target in special_tokens:
             valid_alignments.append(align)
             if align.source == UNALIGNED_MARKER:
@@ -200,7 +189,21 @@ def _validate_alignment(
                 explicitly_unaligned_source.add(align.source)
             continue
 
-        # Validate regular alignments
+        # Validate format
+        if not align.source or not align.source.strip():
+            invalid_source.append("<empty>")
+            continue
+        if len(align.source.split()) > 1:
+            invalid_source.append(repr(align.source))
+            continue
+        if not align.target or not align.target.strip():
+            invalid_target.append("<empty>")
+            continue
+        if len(align.target.split()) > 1:
+            invalid_target.append(repr(align.target))
+            continue
+
+        # Validate tokens exist in mappings
         s_valid = source_mapping.get_position(align.source) != -1
         t_valid = target_mapping.get_position(align.target) != -1
 
@@ -209,38 +212,53 @@ def _validate_alignment(
         else:
             if not s_valid:
                 invalid_source.append(repr(align.source))
+                logger.error(
+                    f"❌ INVALID SOURCE TOKEN: {repr(align.source)} not in mapping. "
+                    f"Available: {source_mapping.uniquified}"
+                )
             if not t_valid:
                 invalid_target.append(repr(align.target))
+                logger.error(
+                    f"❌ INVALID TARGET TOKEN: {repr(align.target)} not in mapping. "
+                    f"Available: {target_mapping.uniquified}"
+                )
 
-    # Helper function to format token counts
-    def format_token_counts(tokens: list[str]) -> str:
+    # Add error messages for invalid tokens
+    if invalid_source:
         from collections import Counter
 
-        counts = Counter(tokens)
-        return ", ".join(
+        counts = Counter(invalid_source)
+        formatted = ", ".join(
             f"{token} (x{count})" if count > 1 else token
             for token, count in sorted(counts.items())
         )
-
-    # Add error messages for invalid tokens with counts
-    if invalid_source:
         errors.append(
             (
                 ValidationErrorType.INVALID_SOURCE_TOKEN,
-                f"Invalid source tokens: {format_token_counts(invalid_source)}",
+                f"Invalid source tokens: {formatted}",
                 invalid_source,
             )
         )
+        logger.error(f"Validation found invalid source tokens: {formatted}")
+
     if invalid_target:
+        from collections import Counter
+
+        counts = Counter(invalid_target)
+        formatted = ", ".join(
+            f"{token} (x{count})" if count > 1 else token
+            for token, count in sorted(counts.items())
+        )
         errors.append(
             (
                 ValidationErrorType.INVALID_TARGET_TOKEN,
-                f"Invalid target tokens: {format_token_counts(invalid_target)}",
+                f"Invalid target tokens: {formatted}",
                 invalid_target,
             )
         )
+        logger.error(f"Validation found invalid target tokens: {formatted}")
 
-    # Calculate remaining tokens, excluding aligned and explicitly unaligned ones
+    # Calculate remaining tokens
     aligned_sources = {
         align.source for align in valid_alignments if align.source not in special_tokens
     }
@@ -263,6 +281,10 @@ def _validate_alignment(
                 list(remaining_source),
             )
         )
+        logger.warning(
+            f"Validation found remaining source tokens: {sorted(remaining_source)}"
+        )
+
     if remaining_target:
         errors.append(
             (
@@ -271,17 +293,13 @@ def _validate_alignment(
                 list(remaining_target),
             )
         )
+        logger.warning(
+            f"Validation found remaining target tokens: {sorted(remaining_target)}"
+        )
 
-    # Consider alignment valid if we have valid alignments and all tokens are accounted for
     is_valid = bool(valid_alignments) and not remaining_source and not remaining_target
 
-    return (
-        is_valid,
-        errors,
-        valid_alignments,
-        remaining_source,
-        remaining_target,
-    )
+    return (is_valid, errors, valid_alignments, remaining_source, remaining_target)
 
 
 def _create_retry_message(
@@ -295,13 +313,13 @@ def _create_retry_message(
     """Create message for retry attempts with partial alignments."""
     message_parts = []
 
-    # First show the complete token lists (snake_case only)
-    message_parts.append(
-        "source_tokens: " + " ".join(make_unique(source_tokens, marker_generator))
-    )
-    message_parts.append(
-        "target_tokens: " + " ".join(make_unique(target_tokens, marker_generator))
-    )
+    # Cache uniquified tokens once to preserve order and avoid recomputation
+    unique_source = make_unique(source_tokens, marker_generator)
+    unique_target = make_unique(target_tokens, marker_generator)
+
+    # First show the complete token lists
+    message_parts.append(SOURCE_TOKENS_PREFIX + " ".join(unique_source))
+    message_parts.append(TARGET_TOKENS_PREFIX + " ".join(unique_target))
     message_parts.append("")
 
     # Add partial alignments
@@ -318,13 +336,18 @@ def _create_retry_message(
     message_parts.append(
         "Only output alignments for the remaining tokens; do not repeat alignments shown above."
     )
+    message_parts.append(
+        "If only one side has remaining tokens, restrict that side to the tokens listed under remaining_source_tokens/remaining_target_tokens."
+    )
     if remaining_source:
+        ordered_remaining_source = [t for t in unique_source if t in remaining_source]
         message_parts.append(
-            "remaining_source_tokens: " + " ".join(sorted(remaining_source))
+            REMAINING_SOURCE_PREFIX + " ".join(ordered_remaining_source)
         )
     if remaining_target:
+        ordered_remaining_target = [t for t in unique_target if t in remaining_target]
         message_parts.append(
-            "remaining_target_tokens: " + " ".join(sorted(remaining_target))
+            REMAINING_TARGET_PREFIX + " ".join(ordered_remaining_target)
         )
 
     return UserMessage("\n".join(message_parts))
@@ -366,9 +389,13 @@ def _process_alignment_sync(
             validation_errors=[],
         )
 
+        # Track prior remaining sets to determine whether this attempt made progress
+        prev_remaining_source = set(remaining_source)
+        prev_remaining_target = set(remaining_target)
+
         try:
             raw_response = llm_adapter(current_messages)
-            raw_response = to_text_alignment(raw_response)
+            raw_response = ensure_text_alignment(raw_response)
             current_attempt.raw_response = raw_response
             logger.debug(f"Raw response: {raw_response}")
 
@@ -390,17 +417,16 @@ def _process_alignment_sync(
 
             # Update unaligned token sets from new alignments
             for align in raw_response.alignment:
-                if align.target_token == UNALIGNED_MARKER:
-                    unaligned_source.add(align.source_token)
-                if align.source_token == UNALIGNED_MARKER:
-                    unaligned_target.add(align.target_token)
+                if align.target == UNALIGNED_MARKER:
+                    unaligned_source.add(align.source)
+                if align.source == UNALIGNED_MARKER:
+                    unaligned_target.add(align.target)
 
             # Filter out alignments containing UNALIGNED_MARKER
             new_valid_alignments = [
                 align
                 for align in new_valid_alignments
-                if align.source_token != UNALIGNED_MARKER
-                and align.target_token != UNALIGNED_MARKER
+                if align.source != UNALIGNED_MARKER and align.target != UNALIGNED_MARKER
             ]
 
             # Deduplicate and sort new alignments
@@ -433,7 +459,12 @@ def _process_alignment_sync(
             remaining_target = remaining_target - unaligned_target
 
             is_complete = not (remaining_source or remaining_target)
-            current_attempt.validation_passed = bool(new_valid_alignments)
+            progress = (
+                len(remaining_source) < len(prev_remaining_source)
+                or len(remaining_target) < len(prev_remaining_target)
+                or bool(new_valid_alignments)
+            )
+            current_attempt.validation_passed = progress
             current_attempt.validation_errors = error_messages
 
             if is_complete:
@@ -497,6 +528,7 @@ def _create_alignment_messages(
     examples: Optional[List[Tuple[List[str], List[str], TextAlignment]]] = None,
     marker_generator: Optional[MarkerGenerator] = None,
     include_schema: bool = False,
+    use_reasoning: bool = False,
 ) -> List[Message]:
     """
     Create the message list for alignment tasks.
@@ -509,6 +541,8 @@ def _create_alignment_messages(
         guidelines: Optional alignment guidelines
         examples: Optional list of example alignments
         marker_generator: Optional MarkerGenerator for unique markers (defaults to subscript)
+        include_schema: Whether to include schema in system message
+        use_reasoning: Whether to request reasoning before alignment
 
     Returns:
         List of messages for the LLM
@@ -537,13 +571,22 @@ def _create_alignment_messages(
         # f"Special tokens: {UNALIGNED_MARKER} (cannot align), <source_specific> (source-only), <target_specific> (target-only). Example: articles→<target_specific>, <source_specific>→particles, punct→{UNALIGNED_MARKER}",
     ]
 
-    if include_schema:
-        schema_obj = create_dynamic_alignment_schema(
-            source_tokens, target_tokens, marker_generator
-        ).model_json_schema()
+    if use_reasoning:
+        from lexi_align.constants import REASONING_PROMPT
+
+        system_msg_parts.append("\n" + REASONING_PROMPT)
         system_msg_parts.append(
-            f"\nExpected JSON format:\n```json\n{json.dumps(schema_obj, ensure_ascii=False)}\n```"
+            "\nIMPORTANT: You MUST provide reasoning in the 'reasoning' field. "
+            "Do not leave it null or empty. Explain your alignment decisions step-by-step."
         )
+
+    if include_schema:
+        DynamicSchema = create_dynamic_alignment_schema(
+            source_tokens, target_tokens, marker_generator
+        )
+        simplified = simplify_schema(DynamicSchema, include_metadata=True)
+        schema_str = simplified.to_string()
+        system_msg_parts.append(f"\nExpected schema:\n```text\n{schema_str}\n```")
 
     system_msg_parts.extend(
         [
@@ -552,6 +595,7 @@ def _create_alignment_messages(
             '2) Emit exactly one JSON object with top-level key "alignment"; no extra text or markdown.',
             "3) Articles and determiners (e.g., 'the', 'a', 'an') are often <unaligned>; output <unaligned> rather than forcing an incorrect pair.",
             "4) Align punctuation only if both sides contain the corresponding punctuation; otherwise use <unaligned>.",
+            "5) Never align <unaligned> with <unaligned>.",
         ]
     )
 
@@ -567,25 +611,107 @@ def _create_alignment_messages(
     messages: List[Message] = [SystemMessage("\n".join(system_msg_parts))]
 
     if examples:
-        for example_source_tokens, example_target_tokens, example_alignment in examples:
-            messages.append(
-                UserMessage(
-                    "source_tokens: "
-                    + " ".join(make_unique(example_source_tokens, marker_generator))
-                    + "\n"
-                    + "target_tokens: "
-                    + " ".join(make_unique(example_target_tokens, marker_generator))
+        logger.debug(f"Processing {len(examples)} training examples")
+        for idx, (
+            example_source_tokens,
+            example_target_tokens,
+            example_alignment,
+        ) in enumerate(examples):
+            try:
+                logger.debug(f"Processing training example {idx}")
+                logger.debug(
+                    f"  Source tokens: {example_source_tokens[:3] if len(example_source_tokens) > 3 else example_source_tokens}..."
                 )
-            )
-            messages.append(AssistantMessage(example_alignment))
+                logger.debug(
+                    f"  Target tokens: {example_target_tokens[:3] if len(example_target_tokens) > 3 else example_target_tokens}..."
+                )
+                logger.debug(f"  Alignment type: {type(example_alignment)}")
+                logger.debug(
+                    f"  Alignment has {len(example_alignment.alignment)} pairs"
+                )
+
+                # Add defensive check for marker_generator
+                if marker_generator is None:
+                    logger.error(f"marker_generator is None at example {idx}!")
+                    marker_generator = create_subscript_generator()
+
+                # Check if marker_generator.generate is callable
+                if not callable(marker_generator.generate):
+                    logger.error(
+                        f"marker_generator.generate is not callable at example {idx}!"
+                    )
+                    logger.error(f"  marker_generator: {marker_generator}")
+                    logger.error(
+                        f"  marker_generator.generate: {marker_generator.generate}"
+                    )
+                    raise ValueError(
+                        f"marker_generator.generate is not callable: {marker_generator.generate}"
+                    )
+
+                # Try the make_unique calls with explicit error handling
+                try:
+                    unique_source = make_unique(example_source_tokens, marker_generator)
+                    logger.debug(
+                        f"  Uniquified source: {unique_source[:3] if len(unique_source) > 3 else unique_source}..."
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error in make_unique for source at example {idx}: {e}",
+                        exc_info=True,
+                    )
+                    raise
+
+                try:
+                    unique_target = make_unique(example_target_tokens, marker_generator)
+                    logger.debug(
+                        f"  Uniquified target: {unique_target[:3] if len(unique_target) > 3 else unique_target}..."
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error in make_unique for target at example {idx}: {e}",
+                        exc_info=True,
+                    )
+                    raise
+
+                messages.append(
+                    UserMessage(
+                        SOURCE_TOKENS_PREFIX
+                        + " ".join(unique_source)
+                        + "\n"
+                        + TARGET_TOKENS_PREFIX
+                        + " ".join(unique_target)
+                    )
+                )
+
+                # Check if alignment serialization works
+                try:
+                    logger.debug("  Serializing alignment...")
+                    messages.append(AssistantMessage(example_alignment))
+                    logger.debug("  Alignment serialized successfully")
+                except Exception as e:
+                    logger.error(
+                        f"Error serializing alignment at example {idx}: {e}",
+                        exc_info=True,
+                    )
+                    raise
+
+            except Exception as e:
+                logger.error(
+                    f"Failed to process training example {idx}:\n"
+                    f"  Source: {example_source_tokens}\n"
+                    f"  Target: {example_target_tokens}\n"
+                    f"  Error: {e}",
+                    exc_info=True,
+                )
+                raise
 
     # Single final user message including both standard and snake_case blocks
     messages.append(
         UserMessage(
-            "source_tokens: "
+            SOURCE_TOKENS_PREFIX
             + " ".join(make_unique(source_tokens, marker_generator))
             + "\n"
-            + "target_tokens: "
+            + TARGET_TOKENS_PREFIX
             + " ".join(make_unique(target_tokens, marker_generator))
         )
     )
@@ -602,6 +728,7 @@ def build_alignment_messages(
     examples: Optional[List[Tuple[List[str], List[str], TextAlignment]]] = None,
     marker_generator: Optional[MarkerGenerator] = None,
     include_schema: bool = False,
+    use_reasoning: bool = False,
 ) -> List[Message]:
     """
     Public wrapper to build alignment chat messages.
@@ -616,6 +743,7 @@ def build_alignment_messages(
         examples=examples,
         marker_generator=marker_generator,
         include_schema=include_schema,
+        use_reasoning=use_reasoning,
     )
 
 
@@ -751,7 +879,8 @@ async def align_many_async(
     examples: Optional[List[Tuple[List[str], List[str], TextAlignment]]] = None,
     max_retries: int = 3,
     marker_generator: Optional[MarkerGenerator] = None,
-    concurrency: int = 8,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    show_progress: bool = True,
 ) -> list[AlignmentResult]:
     """
     Async convenience: align many (src,tgt) pairs with bounded concurrency.
@@ -779,9 +908,31 @@ async def align_many_async(
                 marker_generator=marker_generator,
             )
 
-    return list(
-        await _asyncio.gather(*[_one(s, t) for s, t in zip(src_seqs, tgt_seqs)])
-    )
+    # Create tasks indexed to preserve order
+    tasks = [_asyncio.create_task(_one(s, t)) for s, t in zip(src_seqs, tgt_seqs)]
+
+    if show_progress:
+        # Track results by original index to preserve order
+        results: list[Optional[AlignmentResult]] = [None] * len(tasks)
+        pending = {task: idx for idx, task in enumerate(tasks)}
+
+        with tqdm(
+            total=len(tasks), desc="Aligning (async)", disable=not show_progress
+        ) as pbar:
+            while pending:
+                done, _ = await _asyncio.wait(
+                    pending.keys(), return_when=_asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    idx = pending.pop(task)
+                    results[idx] = await task
+                    pbar.update(1)
+
+        # Return results in original order (filter None just in case of errors)
+        return [r for r in results if r is not None]  # type: ignore[misc]
+    else:
+        # gather() preserves order naturally
+        return list(await _asyncio.gather(*tasks))
 
 
 def build_micro_metrics(
@@ -870,7 +1021,8 @@ def align_tokens(
         guidelines,
         examples,
         marker_generator,
-        include_schema=llm_adapter.include_schema,  # NEW
+        include_schema=llm_adapter.include_schema,
+        use_reasoning=llm_adapter.use_reasoning,
     )
 
     logger.debug(f"Source mapping: {source_mapping.uniquified}")
@@ -925,6 +1077,7 @@ async def align_tokens_async(
         examples,
         marker_generator,
         include_schema=llm_adapter.include_schema,  # parity with sync
+        use_reasoning=llm_adapter.use_reasoning,
     )
 
     attempts: List[AlignmentAttempt] = []
@@ -946,9 +1099,13 @@ async def align_tokens_async(
             validation_passed=False,
             validation_errors=[],
         )
+
+        # Track prior remaining sets to determine whether this attempt made progress
+        prev_remaining_source = set(remaining_source)
+        prev_remaining_target = set(remaining_target)
         try:
             raw = await llm_adapter.acall(current_messages)
-            ta = to_text_alignment(raw)
+            ta = ensure_text_alignment(raw)
             current_attempt.raw_response = ta
 
             (
@@ -1004,7 +1161,12 @@ async def align_tokens_async(
             remaining_target = rem_tgt - unaligned_target
 
             is_complete = not (remaining_source or remaining_target)
-            current_attempt.validation_passed = bool(new_valid_alignments)
+            progress = (
+                len(remaining_source) < len(prev_remaining_source)
+                or len(remaining_target) < len(prev_remaining_target)
+                or bool(new_valid_alignments)
+            )
+            current_attempt.validation_passed = progress
             current_attempt.validation_errors = error_messages
 
             if is_complete:
@@ -1052,7 +1214,7 @@ async def align_tokens_async(
 
 def batch_sequences(sequences: list, chunk_size: int) -> list[list]:
     """Split sequences into chunks of specified size."""
-    return [sequences[i : i + chunk_size] for i in range(0, len(sequences), chunk_size)]
+    return batch_iterable(sequences, chunk_size)
 
 
 def align_tokens_batched(
@@ -1065,7 +1227,8 @@ def align_tokens_batched(
     examples: Optional[List[Tuple[List[str], List[str], TextAlignment]]] = None,
     max_retries: int = 3,
     marker_generator: Optional[MarkerGenerator] = None,
-    batch_size: int = 5,
+    batch_size: Optional[int] = None,
+    show_progress: bool = True,
 ) -> Sequence[AlignmentResult]:
     """Process multiple sequences of tokens for alignment with proper retry handling."""
     if len(source_sequences) != len(target_sequences):
@@ -1112,7 +1275,8 @@ def align_tokens_batched(
             guidelines,
             examples,
             marker_generator,
-            include_schema=llm_adapter.include_schema,  # NEW
+            include_schema=llm_adapter.include_schema,
+            use_reasoning=llm_adapter.use_reasoning,
         )
         for src, tgt in zip(source_sequences, target_sequences)
     ]
@@ -1120,8 +1284,32 @@ def align_tokens_batched(
     final_results: list[Optional[TextAlignment]] = [None] * len(source_sequences)
     existing_valid_alignments: list[list[TokenAlignment]] = [
         [] for _ in source_sequences
-    ]  # NEW
+    ]
     retry_indices = list(range(len(source_sequences)))
+
+    # Create progress bar to track completed sequences
+    pbar = tqdm(
+        total=len(source_sequences),
+        desc="Aligning (batched)",
+        disable=not show_progress,
+        unit="seq",
+    )
+
+    # Resolve effective batch size when not provided by caller
+    if batch_size is None:
+        pref = getattr(llm_adapter, "preferred_batch_size", None)
+        val = llm_adapter.preferred_batch_size() if callable(pref) else None
+        batch_size = val if isinstance(val, int) and val > 0 else DEFAULT_BATCH_SIZE
+
+    # Track remaining/unaligned state per sequence for correct progress detection
+    remaining_sources_state: list[set[str]] = [
+        set(m.uniquified) for m in source_mappings
+    ]
+    remaining_targets_state: list[set[str]] = [
+        set(m.uniquified) for m in target_mappings
+    ]
+    unaligned_sources_state: list[set[str]] = [set() for _ in source_sequences]
+    unaligned_targets_state: list[set[str]] = [set() for _ in target_sequences]
 
     for attempt in range(max_retries):
         if not retry_indices:
@@ -1171,7 +1359,7 @@ def align_tokens_batched(
 
                 # Normalize and validate
                 try:
-                    ta = to_text_alignment(result)
+                    ta = ensure_text_alignment(result)
                 except Exception as e:
                     sequence_attempts[seq_idx].append(
                         AlignmentAttempt(
@@ -1202,22 +1390,61 @@ def align_tokens_batched(
                     target_mapping=target_mappings[seq_idx],
                 )
 
-                # Update existing valid alignments
-                existing_valid_alignments[seq_idx] = valid_aligns
+                # Track explicit <unaligned> tokens from this generation and update remaining sets
+                unaligned_source_cur = {
+                    a.source for a in ta.alignment if a.target == UNALIGNED_MARKER
+                }
+                unaligned_target_cur = {
+                    a.target for a in ta.alignment if a.source == UNALIGNED_MARKER
+                }
+                unaligned_sources_state[seq_idx].update(unaligned_source_cur)
+                unaligned_targets_state[seq_idx].update(unaligned_target_cur)
+                remaining_source = remaining_source - unaligned_sources_state[seq_idx]
+                remaining_target = remaining_target - unaligned_targets_state[seq_idx]
+
+                # Determine progress compared to previous remaining sets
+                prev_rs = remaining_sources_state[seq_idx]
+                prev_rt = remaining_targets_state[seq_idx]
+
+                # Filter out UNALIGNED pairs from stored valid alignments
+                valid_aligns_filtered = [
+                    a
+                    for a in valid_aligns
+                    if a.source != UNALIGNED_MARKER and a.target != UNALIGNED_MARKER
+                ]
+
+                # Correctly detect progress by checking if we got NEW alignments
+                prev_alignment_count = len(existing_valid_alignments[seq_idx])
+                new_alignment_count = len(valid_aligns_filtered)
+                has_new_alignments = new_alignment_count > prev_alignment_count
+
+                progress = (
+                    len(remaining_source) < len(prev_rs)
+                    or len(remaining_target) < len(prev_rt)
+                    or has_new_alignments
+                )
+
+                remaining_sources_state[seq_idx] = set(remaining_source)
+                remaining_targets_state[seq_idx] = set(remaining_target)
+
+                # Update stored alignments AFTER checking progress
+                existing_valid_alignments[seq_idx] = valid_aligns_filtered
+
+                is_complete = not (remaining_source or remaining_target)
 
                 sequence_attempts[seq_idx].append(
                     AlignmentAttempt(
                         attempt_number=attempt + 1,
                         messages_sent=msgs_sent,
                         raw_response=ta,
-                        validation_passed=is_valid,
-                        validation_errors=error_msg if not is_valid else [],
+                        validation_passed=progress,
+                        validation_errors=error_msg if not is_complete else [],
                     )
                 )
 
-                if is_valid:
+                if is_complete:
                     final_results[seq_idx] = TextAlignment(
-                        alignment=valid_aligns,
+                        alignment=valid_aligns_filtered,
                         source_mapping=source_mappings[seq_idx],
                         target_mapping=target_mappings[seq_idx],
                     ).sort_by_position(
@@ -1228,7 +1455,7 @@ def align_tokens_batched(
                     sequence_messages[seq_idx].append(AssistantMessage(ta))
                     sequence_messages[seq_idx].append(
                         _create_retry_message(
-                            valid_aligns,
+                            valid_aligns_filtered,
                             remaining_source,
                             remaining_target,
                             source_sequences[seq_idx],
@@ -1238,7 +1465,15 @@ def align_tokens_batched(
                     )
                     new_retry_indices_total.append(seq_idx)
 
+        # Update progress: sequences that are no longer in retry list are complete
+        newly_completed = len(retry_indices) - len(new_retry_indices_total)
+        pbar.update(newly_completed)
+
         retry_indices = new_retry_indices_total
+
+    # Update progress bar for any remaining incomplete sequences and close
+    pbar.update(len(retry_indices))  # Count remaining incomplete as "done" (failed)
+    pbar.close()
 
     # Create final AlignmentResults
     final_alignment_results: list[AlignmentResult] = []
@@ -1261,6 +1496,412 @@ def align_tokens_batched(
             AlignmentResult(alignment=sorted_result, attempts=attempts)
         )
     return final_alignment_results
+
+
+def align_dataset(
+    adapter: LLMAdapter,
+    source_sequences: Sequence[Sequence[str] | str],
+    target_sequences: Sequence[Sequence[str] | str],
+    *,
+    source_language: Optional[str] = None,
+    target_language: Optional[str] = None,
+    guidelines: Optional[str] = None,
+    examples: Optional[List[Tuple[List[str], List[str], TextAlignment]]] = None,
+    max_retries: int = 3,
+    marker_generator: Optional[MarkerGenerator] = None,
+    concurrency: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    show_progress: bool = True,
+) -> list[AlignmentResult]:
+    """
+    Align multiple sequence pairs with automatic optimization.
+
+    Automatically selects the best processing strategy:
+    - True batching if adapter supports it and batch_size specified
+    - Async concurrent processing if adapter supports async
+    - Sequential processing otherwise
+
+    Args:
+        adapter: LLM adapter to use
+        source_sequences: List of source token sequences (strings or lists)
+        target_sequences: List of target token sequences (strings or lists)
+        source_language: Source language name
+        target_language: Target language name
+        guidelines: Optional alignment guidelines
+        examples: Optional few-shot examples
+        max_retries: Max retries per alignment (default: 3)
+        marker_generator: Optional marker generator
+        concurrency: Max concurrent requests for async (default: from adapter)
+        batch_size: Batch size for batching (default: from adapter)
+        show_progress: Show progress bar (default: True)
+
+    Returns:
+        List of AlignmentResult objects
+
+    Example:
+        >>> from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
+        >>> adapter = LiteLLMAdapter(model_params={"model": "gpt-4o-mini"})
+        >>> source = [["The", "cat"], ["A", "dog"]]
+        >>> target = [["Le", "chat"], ["Un", "chien"]]
+        >>> results = align_dataset(adapter, source, target, show_progress=False)
+        >>> len(results)
+        2
+        >>> all(r.alignment for r in results)
+        True
+    """
+    if len(source_sequences) != len(target_sequences):
+        raise ValueError(
+            f"Number of source and target sequences must match "
+            f"(got {len(source_sequences)} vs {len(target_sequences)})"
+        )
+
+    # Normalize sequences to lists of strings
+    def normalize_seq(seq: Sequence[str] | str) -> list[str]:
+        return seq.split() if isinstance(seq, str) else list(seq)
+
+    sources = [normalize_seq(s) for s in source_sequences]
+    targets = [normalize_seq(t) for t in target_sequences]
+
+    # Get adapter capabilities
+    caps = adapter.capabilities
+
+    # Determine batch size
+    effective_batch_size = batch_size or caps.get("preferred_batch_size")
+
+    # Determine concurrency
+    effective_concurrency = (
+        concurrency or caps.get("max_concurrency") or DEFAULT_CONCURRENCY
+    )
+
+    # Select processing strategy
+    if effective_batch_size and caps["supports_batching"]:
+        logger.info(f"Using batch processing (batch_size={effective_batch_size})")
+        return list(
+            align_tokens_batched(
+                adapter,
+                sources,
+                targets,
+                source_language=source_language,
+                target_language=target_language,
+                guidelines=guidelines,
+                examples=examples,
+                max_retries=max_retries,
+                marker_generator=marker_generator,
+                batch_size=effective_batch_size,
+                show_progress=show_progress,
+            )
+        )
+    elif caps["supports_async"]:
+        logger.info(f"Using async processing (concurrency={effective_concurrency})")
+        return asyncio_run(
+            align_many_async(
+                adapter,
+                list(zip(sources, targets)),
+                source_language=source_language,
+                target_language=target_language,
+                guidelines=guidelines,
+                examples=examples,
+                max_retries=max_retries,
+                marker_generator=marker_generator,
+                concurrency=effective_concurrency,
+                show_progress=show_progress,
+            )
+        )
+    else:
+        logger.info("Using sequential processing")
+
+        # Add progress wrapper for sequential processing
+        if show_progress:
+            results = []
+            for s, t in tqdm(
+                zip(sources, targets),
+                total=len(sources),
+                desc="Aligning",
+                disable=not show_progress,
+            ):
+                result = align_tokens(
+                    adapter,
+                    s,
+                    t,
+                    source_language=source_language,
+                    target_language=target_language,
+                    guidelines=guidelines,
+                    examples=examples,
+                    max_retries=max_retries,
+                    marker_generator=marker_generator,
+                )
+                results.append(result)
+            return results
+        else:
+            return align_many(
+                adapter,
+                list(zip(sources, targets)),
+                source_language=source_language,
+                target_language=target_language,
+                guidelines=guidelines,
+                examples=examples,
+                max_retries=max_retries,
+                marker_generator=marker_generator,
+            )
+
+
+def align_and_evaluate_dataset(
+    adapter: LLMAdapter,
+    source_sequences: Sequence[Sequence[str] | str],
+    target_sequences: Sequence[Sequence[str] | str],
+    gold_alignments: Sequence[TextAlignment],
+    *,
+    source_language: Optional[str] = None,
+    target_language: Optional[str] = None,
+    guidelines: Optional[str] = None,
+    examples: Optional[List[Tuple[List[str], List[str], TextAlignment]]] = None,
+    max_retries: int = 3,
+    marker_generator: Optional[MarkerGenerator] = None,
+    concurrency: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    show_progress: bool = True,
+) -> tuple[list[AlignmentResult], dict[str, Any]]:
+    """Align dataset and evaluate against gold standard.
+
+    Convenience function that combines alignment and evaluation in one call.
+
+    Args:
+        adapter: LLM adapter to use
+        source_sequences: List of source token sequences
+        target_sequences: List of target token sequences
+        gold_alignments: Gold standard alignments for evaluation
+        source_language: Source language name
+        target_language: Target language name
+        guidelines: Optional alignment guidelines
+        examples: Optional few-shot examples
+        max_retries: Max retries per alignment
+        marker_generator: Optional marker generator
+        concurrency: Max concurrent requests for async
+        batch_size: Batch size for batching
+        show_progress: Show progress bar
+
+    Returns:
+        Tuple of (alignment_results, metrics_dict)
+
+    Example:
+        >>> from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
+        >>> from lexi_align.models import TextAlignment, TokenAlignment
+        >>> adapter = LiteLLMAdapter(model_params={"model": "gpt-4o-mini"})
+        >>> sources = [["The", "cat"], ["A", "dog"]]
+        >>> targets = [["Le", "chat"], ["Un", "chien"]]
+        >>> gold = [
+        ...     TextAlignment(alignment=[
+        ...         TokenAlignment(source="The", target="Le"),
+        ...         TokenAlignment(source="cat", target="chat")
+        ...     ]),
+        ...     TextAlignment(alignment=[
+        ...         TokenAlignment(source="A", target="Un"),
+        ...         TokenAlignment(source="dog", target="chien")
+        ...     ])
+        ... ]
+        >>> results, metrics = align_and_evaluate_dataset(
+        ...     adapter, sources, targets, gold, show_progress=False
+        ... )
+        >>> len(results)
+        2
+        >>> "micro" in metrics
+        True
+    """
+    if len(gold_alignments) != len(source_sequences):
+        raise ValueError(
+            f"Number of gold alignments must match number of sequences "
+            f"(got {len(gold_alignments)} vs {len(source_sequences)})"
+        )
+
+    # Run alignment
+    results = align_dataset(
+        adapter,
+        source_sequences,
+        target_sequences,
+        source_language=source_language,
+        target_language=target_language,
+        guidelines=guidelines,
+        examples=examples,
+        max_retries=max_retries,
+        marker_generator=marker_generator,
+        concurrency=concurrency,
+        batch_size=batch_size,
+        show_progress=show_progress,
+    )
+
+    # Filter successful alignments and corresponding gold
+    predicted = [r.alignment for r in results if r.alignment]
+    gold = [g for r, g in zip(results, gold_alignments) if r.alignment]
+
+    if not predicted:
+        logger.warning("No successful alignments to evaluate")
+        return results, {
+            "micro": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f_measure": 0.0,
+                "aer": 1.0,
+                "total_predicted": 0,
+                "total_gold": 0,
+                "total_true_positives": 0,
+            },
+            "macro": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f_measure": 0.0,
+                "aer": 1.0,
+            },
+            "per_example": [],
+            "token_stats": {"source": {}, "target": {}},
+            "summary": {
+                "total_examples": len(results),
+                "total_predictions": 0,
+                "total_gold": sum(len(g.alignment) for g in gold_alignments),
+            },
+        }
+
+    # Evaluate
+    metrics = evaluate_alignments(predicted, gold)
+
+    return results, metrics
+
+
+def evaluate_alignments(
+    predictions: Sequence[TextAlignment],
+    gold: Sequence[TextAlignment],
+) -> dict[str, Any]:
+    """
+    Evaluate predicted alignments against gold standard.
+
+    Returns comprehensive metrics including:
+    - Micro-averaged precision, recall, F1, AER
+    - Per-alignment metrics
+    - Token-level statistics
+
+    Args:
+        predictions: List of predicted TextAlignment objects
+        gold: List of gold standard TextAlignment objects
+
+    Returns:
+        Dictionary with evaluation metrics
+
+    Example:
+        >>> from lexi_align.models import TextAlignment, TokenAlignment
+        >>> pred = [TextAlignment(alignment=[
+        ...     TokenAlignment(source="the", target="le"),
+        ...     TokenAlignment(source="cat", target="chat")
+        ... ])]
+        >>> gold = [TextAlignment(alignment=[
+        ...     TokenAlignment(source="the", target="le"),
+        ...     TokenAlignment(source="cat", target="chat")
+        ... ])]
+        >>> metrics = evaluate_alignments(pred, gold)
+        >>> metrics['micro']['precision']
+        1.0
+        >>> metrics['micro']['f_measure']
+        1.0
+    """
+    if len(predictions) != len(gold):
+        raise ValueError(
+            f"Number of predictions and gold alignments must match "
+            f"(got {len(predictions)} vs {len(gold)})"
+        )
+
+    from lexi_align.metrics import calculate_metrics
+
+    # Calculate per-example metrics
+    per_example_metrics = []
+    for pred, gold_align in zip(predictions, gold):
+        metrics = calculate_metrics(pred, gold_align)
+        per_example_metrics.append(metrics)
+
+    # Calculate micro-averaged metrics
+    micro_metrics = build_micro_metrics(list(zip(predictions, gold)))
+
+    # Calculate macro-averaged metrics
+    macro_precision = sum(m["precision"] for m in per_example_metrics) / len(
+        per_example_metrics
+    )
+    macro_recall = sum(m["recall"] for m in per_example_metrics) / len(
+        per_example_metrics
+    )
+    macro_f = sum(m["f_measure"] for m in per_example_metrics) / len(
+        per_example_metrics
+    )
+    macro_aer = sum(m["aer"] for m in per_example_metrics) / len(per_example_metrics)
+
+    # Token-level analysis
+    token_stats = _analyze_token_level_accuracy(predictions, gold)
+
+    return {
+        "micro": micro_metrics,
+        "macro": {
+            "precision": macro_precision,
+            "recall": macro_recall,
+            "f_measure": macro_f,
+            "aer": macro_aer,
+        },
+        "per_example": per_example_metrics,
+        "token_stats": token_stats,
+        "summary": {
+            "total_examples": len(predictions),
+            "total_predictions": sum(len(p.alignment) for p in predictions),
+            "total_gold": sum(len(g.alignment) for g in gold),
+        },
+    }
+
+
+def _analyze_token_level_accuracy(
+    predictions: Sequence[TextAlignment],
+    gold: Sequence[TextAlignment],
+) -> dict[str, dict[str, dict[str, int | float]]]:
+    """Analyze per-token alignment accuracy across dataset."""
+
+    # Track statistics per unique token
+    source_stats: dict[str, dict[str, int]] = {}
+    target_stats: dict[str, dict[str, int]] = {}
+
+    for pred, gold_align in zip(predictions, gold):
+        pred_pairs = {(a.source, a.target) for a in pred.alignment}
+        gold_pairs = {(a.source, a.target) for a in gold_align.alignment}
+        correct_pairs = pred_pairs & gold_pairs
+
+        # Track source tokens
+        for src, tgt in gold_pairs:
+            if src not in source_stats:
+                source_stats[src] = {"correct": 0, "total": 0}
+            source_stats[src]["total"] += 1
+            if (src, tgt) in correct_pairs:
+                source_stats[src]["correct"] += 1
+
+        # Track target tokens
+        for src, tgt in gold_pairs:
+            if tgt not in target_stats:
+                target_stats[tgt] = {"correct": 0, "total": 0}
+            target_stats[tgt]["total"] += 1
+            if (src, tgt) in correct_pairs:
+                target_stats[tgt]["correct"] += 1
+
+    # Calculate accuracy for each token
+    def compute_accuracy(
+        stats: dict[str, dict[str, int]],
+    ) -> dict[str, dict[str, int | float]]:
+        return {
+            token: {
+                "correct": counts["correct"],
+                "total": counts["total"],
+                "accuracy": counts["correct"] / counts["total"]
+                if counts["total"] > 0
+                else 0.0,
+            }
+            for token, counts in stats.items()
+            if counts["total"] >= 3  # Only include tokens with 3+ occurrences
+        }
+
+    return {
+        "source": compute_accuracy(source_stats),
+        "target": compute_accuracy(target_stats),
+    }
 
 
 def align_tokens_raw(
@@ -1302,10 +1943,10 @@ def align_tokens_raw(
     messages_dicts.append(
         {
             "role": "user",
-            "content": "source_tokens: "
+            "content": SOURCE_TOKENS_PREFIX
             + " ".join(make_unique(source_tokens))
             + "\n"
-            + "target_tokens: "
+            + TARGET_TOKENS_PREFIX
             + " ".join(make_unique(target_tokens)),
         }
     )
@@ -1317,7 +1958,7 @@ def align_tokens_raw(
         result = llm_adapter(formatted_messages)
 
         # Normalize result to TextAlignment
-        result = to_text_alignment(result)
+        result = ensure_text_alignment(result)
 
         # Validate the alignment
         (
@@ -1392,10 +2033,10 @@ async def align_tokens_raw_async(
     messages_dicts.append(
         {
             "role": "user",
-            "content": "source_tokens: "
+            "content": SOURCE_TOKENS_PREFIX
             + " ".join(make_unique(source_tokens))
             + "\n"
-            + "target_tokens: "
+            + TARGET_TOKENS_PREFIX
             + " ".join(make_unique(target_tokens)),
         }
     )
@@ -1405,7 +2046,7 @@ async def align_tokens_raw_async(
     target_mapping = create_token_mapping(target_tokens)
     try:
         result = await llm_adapter.acall(formatted_messages)
-        result = to_text_alignment(result)
+        result = ensure_text_alignment(result)
         (
             is_valid,
             error_messages,

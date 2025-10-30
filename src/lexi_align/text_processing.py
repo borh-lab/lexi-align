@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass
+from functools import cache
 from typing import Callable, Pattern
 
 
@@ -11,8 +12,9 @@ class MarkerGenerator:
     pattern: Pattern[str]
 
 
+@cache
 def create_subscript_generator() -> MarkerGenerator:
-    """Create a generator for subscript number markers."""
+    """Create a generator for subscript number markers (cached)."""
     subscript_digits = "₀₁₂₃₄₅₆₇₈₉"
 
     def generator(num: int) -> str:
@@ -21,8 +23,9 @@ def create_subscript_generator() -> MarkerGenerator:
     return MarkerGenerator(generate=generator, pattern=re.compile(r"[₀₁₂₃₄₅₆₇₈₉]+$"))
 
 
+@cache
 def create_underscore_generator() -> MarkerGenerator:
-    """Create a generator for underscore number markers."""
+    """Create a generator for underscore number markers (cached)."""
     return MarkerGenerator(generate=lambda n: f"_{n}", pattern=re.compile(r"_[0-9]+$"))
 
 

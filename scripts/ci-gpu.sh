@@ -4,4 +4,4 @@ uv run ruff format
 uv run ruff check --fix
 uv run ruff check --select I --fix
 uv run mypy --show-error-context --check-untyped-defs src tests evaluations
-uv run pytest -vvv --log-level=DEBUG
+uv run --dev --extra $ACCELERATOR pytest -vvv --log-level=DEBUG

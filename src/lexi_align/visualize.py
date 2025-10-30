@@ -10,10 +10,16 @@ import seaborn as sns  # type: ignore
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 
+# import japanize_matplotlib  # noqa: F401
+from pyfonts import load_google_font, set_default_font  # type: ignore[import-untyped]
+
 from lexi_align.models import TextAlignment
 from lexi_align.utils import create_token_mapping, make_unique
 
 logger = getLogger(__name__)
+
+font = load_google_font("IBM Plex Sans JP")
+set_default_font(font)  # Sets font for all text
 
 
 def visualize_alignments(

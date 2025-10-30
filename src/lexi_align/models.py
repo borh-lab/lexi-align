@@ -5,6 +5,7 @@ from enum import Enum
 from logging import getLogger
 from typing import (
     TYPE_CHECKING,
+    Any,
     Dict,
     List,
     Literal,
@@ -15,11 +16,13 @@ from typing import (
 )
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic.json_schema import GenerateJsonSchema
 from typing_extensions import Self
 
 if TYPE_CHECKING:
     from lexi_align.adapters.base import LLMAdapter
 
+from lexi_align.constants import UNALIGNED_MARKER as _UNALIGNED_MARKER
 from lexi_align.text_processing import (
     MarkerGenerator,
     create_subscript_generator,
@@ -56,7 +59,7 @@ class SpecialTokens(str, Enum):
     TARGET_SPECIFIC = "<target_specific>"
 
 
-UNALIGNED_MARKER = SpecialTokens.UNALIGNED.value
+UNALIGNED_MARKER = _UNALIGNED_MARKER
 
 
 def _create_token_enum(name: str, tokens: list[str]) -> Type[Enum]:
@@ -288,18 +291,13 @@ class TokenAlignment(BaseModel):
     source: str = Field(description="A token from the source text.")
     target: str = Field(description="A token from the target text.")
 
-    # Deprecated properties
-    @property
-    def source_token(self) -> str:
-        return self.source
-
-    @property
-    def target_token(self) -> str:
-        return self.target
-
 
 class TextAlignmentSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    reasoning: Optional[str] = Field(
+        default=None,
+        description="Optional step-by-step reasoning explaining alignment decisions, considering semantic equivalence, syntactic roles, idiomatic expressions, and structural differences between languages.",
+    )
     alignment: List[TokenAlignment] = Field(
         description="A list of (source_token, target_token) TokenAlignment objects representing the alignment between tokens in the source and target texts. The provided tokens are space-delimited strings and should not be further split. A token can be aligned to multiple tokens; in such cases, include multiple tuples with the same source_token paired with different target_tokens. Unaligned tokens (typically those with predominantly grammatical function) can be omitted from the alignment list. For disambiguation, if a token appears multiple times, a suffix is appended to it; reuse this suffix to ensure correct alignment."
     )
@@ -325,11 +323,12 @@ class TextAlignment(TextAlignmentSchema):
     def validate_and_sort_alignment(self) -> Self:
         """Ensure alignments are deduplicated and sorted while preserving special tokens."""
 
-        # First deduplicate while preserving special tokens
-        # logger.debug(f"Deduplicating alignments in validate_and_sort: {self}")
+        # First deduplicate and filter invalid pairs
         unique_pairs = set()
         special_alignments = []
         regular_alignments = []
+        duplicates_count = 0
+        both_unaligned_count = 0
 
         # Get list of special token values for comparison
         special_tokens = {
@@ -340,20 +339,40 @@ class TextAlignment(TextAlignmentSchema):
 
         for align in self.alignment:
             pair = (align.source, align.target)
-            if pair not in unique_pairs:
-                unique_pairs.add(pair)
-                # Check if either token is a special token
-                if align.source in special_tokens or align.target in special_tokens:
-                    special_alignments.append(align)
-                    # logger.debug(f"Found special token alignment: {align}")
-                else:
-                    regular_alignments.append(align)
+
+            # Filter both-unaligned pairs
+            if align.source == UNALIGNED_MARKER and align.target == UNALIGNED_MARKER:
+                both_unaligned_count += 1
+                logger.warning(
+                    "Filtering out invalid alignment with both source and target as <unaligned>"
+                )
+                continue
+
+            # Check for duplicates
+            if pair in unique_pairs:
+                duplicates_count += 1
+                continue
+
+            unique_pairs.add(pair)
+
+            # Check if either token is a special token
+            if align.source in special_tokens or align.target in special_tokens:
+                special_alignments.append(align)
+            else:
+                regular_alignments.append(align)
+
+        # Log summary if any pairs were filtered
+        if duplicates_count > 0:
+            logger.warning(
+                f"Filtered out {duplicates_count} duplicate alignment pair(s)"
+            )
+        if both_unaligned_count > 0:
+            logger.warning(
+                f"Filtered out {both_unaligned_count} both-unaligned pair(s)"
+            )
 
         # Try to sort regular alignments if we have mappings
         if self.source_mapping and self.target_mapping:
-            # logger.debug(
-            #     f"Sorting regular alignments in validate_and_sort: {regular_alignments}"
-            # )
             regular_alignments = self.sort_alignments(
                 regular_alignments, self.source_mapping, self.target_mapping
             )
@@ -361,7 +380,6 @@ class TextAlignment(TextAlignmentSchema):
         # Combine special tokens with sorted regular alignments
         # Special tokens go at the end by convention
         self.alignment = regular_alignments + special_alignments
-        # logger.debug(f"Final alignment after sorting: {self.alignment}")
 
         return self
 
@@ -516,8 +534,8 @@ class TextAlignment(TextAlignmentSchema):
             )
         positions: list[tuple[int, int]] = []
         for align in self.alignment:
-            s_pos = sm.get_position(align.source_token)
-            t_pos = tm.get_position(align.target_token)
+            s_pos = sm.get_position(align.source)
+            t_pos = tm.get_position(align.target)
             if s_pos >= 0 and t_pos >= 0:
                 positions.append((s_pos, t_pos))
         return sorted(positions)
@@ -528,8 +546,8 @@ class TextAlignment(TextAlignmentSchema):
         Returns:
             Tuple of (source_tokens, target_tokens) sets
         """
-        source_tokens = {align.source_token for align in self.alignment}
-        target_tokens = {align.target_token for align in self.alignment}
+        source_tokens = {align.source for align in self.alignment}
+        target_tokens = {align.target for align in self.alignment}
         return source_tokens, target_tokens
 
     def compare_alignments(
@@ -571,6 +589,8 @@ def create_dynamic_alignment_schema(
     marker_generator: Optional[MarkerGenerator] = None,
     min_length: Optional[int] = None,
     max_length: Optional[int] = None,
+    tokens_are_uniquified: bool = False,
+    use_reasoning: bool = False,
 ) -> Type[TextAlignmentSchema]:
     """Create a dynamic schema with token-specific validation.
 
@@ -580,6 +600,8 @@ def create_dynamic_alignment_schema(
         marker_generator: Optional marker generator for unique markers
         min_length: Optional minimum length constraint for alignments
         max_length: Optional maximum length constraint for alignments
+        tokens_are_uniquified: If True, assume provided tokens already include unique markers and do not re-uniquify.
+        use_reasoning: If True, include reasoning field in schema
 
     Returns:
         A new TextAlignmentSchema subclass with token-specific validation
@@ -588,9 +610,15 @@ def create_dynamic_alignment_schema(
     if marker_generator is None:
         marker_generator = create_subscript_generator()
 
-    # Create unique token lists first
-    unique_source = make_unique(source_tokens, marker_generator)
-    unique_target = make_unique(target_tokens, marker_generator)
+    # Build enum token lists:
+    # - If tokens_are_uniquified=True, assume tokens already carry unique markers and keep them.
+    # - Otherwise, uniquify now (default behavior).
+    if tokens_are_uniquified:
+        unique_source = source_tokens
+        unique_target = target_tokens
+    else:
+        unique_source = make_unique(source_tokens, marker_generator)
+        unique_target = make_unique(target_tokens, marker_generator)
 
     # Create enums directly from the tokens plus special tokens
     source_enum = create_source_token_enum(unique_source)
@@ -610,58 +638,214 @@ def create_dynamic_alignment_schema(
         source: source_enum  # type: ignore
         target: target_enum  # type: ignore
 
-        @model_validator(mode="after")
-        def _no_both_unaligned(self) -> "DynamicTokenAlignment":
-            if self.source == UNALIGNED_MARKER and self.target == UNALIGNED_MARKER:
-                raise ValueError(
-                    "Both source and target cannot be <unaligned> in one pair"
-                )
-            return self
-
     # Create the schema class with the dynamic token alignment
-    class DynamicTextAlignmentSchema(TextAlignmentSchema):
-        """Dynamic text alignment schema with enum-based validation."""
+    # Split into two definitions based on use_reasoning flag to properly handle field requirements
+    if use_reasoning:
 
-        model_config = ConfigDict(extra="forbid")
-        # model_config = ConfigDict(arbitrary_types_allowed=True)
-        if TYPE_CHECKING:
-            alignment: list[TokenAlignment]
-        else:
-            alignment: list[DynamicTokenAlignment] = Field(
-                min_length=min_length,
-                max_length=max_length,
+        class _DynamicTextAlignmentSchemaWithReasoning(TextAlignmentSchema):
+            """Dynamic text alignment schema with required reasoning."""
+
+            model_config = ConfigDict(extra="forbid")
+
+            # Override parent's optional field with required field
+            reasoning: str = Field(
+                ...,  # Ellipsis makes it required (no default)
+                min_length=50,
+                max_length=2000,
+                description="Provide detailed step-by-step reasoning about alignment decisions, considering: semantic equivalence, syntactic roles, idiomatic expressions, and structural differences between languages. Explain why each alignment choice was made. Minimum 50 characters required.",
             )
 
-        @model_validator(mode="after")
-        def _check_unique_pairs(self) -> "DynamicTextAlignmentSchema":
-            seen: set[tuple[str, str]] = set()
-            for a in self.alignment:
-                pair = (a.source, a.target)
-                if pair in seen:
-                    raise ValueError(
-                        f"Duplicate alignment pairs are not allowed: {pair}"
+            if TYPE_CHECKING:
+                alignment: list[TokenAlignment]
+            else:
+                alignment: list[DynamicTokenAlignment] = Field(
+                    min_length=min_length,
+                    max_length=max_length,
+                )
+
+            @model_validator(mode="after")
+            def _filter_invalid_pairs(
+                self,
+            ) -> "_DynamicTextAlignmentSchemaWithReasoning":
+                """Filter out invalid alignment pairs and log warnings."""
+                seen: set[tuple[str, str]] = set()
+                filtered: list[TokenAlignment] = []
+                duplicates_count = 0
+                both_unaligned_count = 0
+
+                for a in self.alignment:
+                    pair = (a.source, a.target)
+
+                    # Check for both-unaligned pairs
+                    if a.source == UNALIGNED_MARKER and a.target == UNALIGNED_MARKER:
+                        both_unaligned_count += 1
+                        logger.warning(
+                            "Filtering out invalid alignment with both source and target as <unaligned>"
+                        )
+                        continue
+
+                    # Check for duplicates
+                    if pair in seen:
+                        duplicates_count += 1
+                        continue
+
+                    seen.add(pair)
+                    filtered.append(a)
+
+                # Log summary if any pairs were filtered
+                if duplicates_count > 0:
+                    logger.warning(
+                        f"Filtered out {duplicates_count} duplicate alignment pair(s)"
                     )
-                seen.add(pair)
-            return self
+                if both_unaligned_count > 0:
+                    logger.warning(
+                        f"Filtered out {both_unaligned_count} both-unaligned pair(s)"
+                    )
 
-        @classmethod
-        def from_base_schema(
-            cls, base: TextAlignmentSchema
-        ) -> "DynamicTextAlignmentSchema":
-            """Convert base schema to dynamic schema."""
-            # Convert TokenAlignment objects to TokenAlignment to satisfy typing
-            alignments_list: list[TokenAlignment] = [
-                TokenAlignment(source=a.source, target=a.target) for a in base.alignment
-            ]
-            return cls(alignment=alignments_list)
+                self.alignment = filtered
+                return self
 
-        def to_base_schema(self) -> TextAlignmentSchema:
-            """Convert dynamic schema to base schema."""
-            # Convert DynamicTokenAlignment objects back to TokenAlignment
-            base_alignments = [
-                TokenAlignment(source=a.source, target=a.target) for a in self.alignment
-            ]
-            return TextAlignmentSchema(alignment=base_alignments)
+            @classmethod
+            def from_base_schema(
+                cls, base: TextAlignmentSchema
+            ) -> "_DynamicTextAlignmentSchemaWithReasoning":
+                """Convert base schema to dynamic schema."""
+                # Convert TokenAlignment objects to TokenAlignment to satisfy typing
+                alignments_list: list[TokenAlignment] = [
+                    TokenAlignment(source=a.source, target=a.target)
+                    for a in base.alignment
+                ]
+                # When use_reasoning=True, we need to provide reasoning (use empty string as fallback)
+                reasoning_text = (
+                    getattr(base, "reasoning", None)
+                    or "Alignment reasoning not provided."
+                )
+                return cls(alignment=alignments_list, reasoning=reasoning_text)
+
+            def to_base_schema(self) -> TextAlignmentSchema:
+                """Convert dynamic schema to base schema."""
+                # Convert DynamicTokenAlignment objects back to TokenAlignment
+                base_alignments = [
+                    TokenAlignment(source=a.source, target=a.target)
+                    for a in self.alignment
+                ]
+                return TextAlignmentSchema(
+                    alignment=base_alignments, reasoning=self.reasoning
+                )
+
+        # Assign to common variable name for return
+        DynamicTextAlignmentSchema = _DynamicTextAlignmentSchemaWithReasoning  # type: ignore[assignment]
+
+    else:
+
+        class _DynamicTextAlignmentSchemaWithoutReasoning(TextAlignmentSchema):
+            """Dynamic text alignment schema with optional reasoning."""
+
+            model_config = ConfigDict(extra="forbid")
+
+            # Inherit parent's optional reasoning field (no override needed)
+
+            @classmethod
+            def model_json_schema(
+                cls,
+                by_alias: bool = True,
+                ref_template: str = "#/$defs/{model}",
+                schema_generator: Optional[Type[GenerateJsonSchema]] = None,
+                mode: str = "validation",
+                **kwargs: Any,
+            ) -> dict[str, Any]:
+                """Override to remove reasoning field from schema."""
+                # Build kwargs for super call, only including schema_generator if not None
+                super_kwargs: dict[str, Any] = {
+                    "by_alias": by_alias,
+                    "ref_template": ref_template,
+                    "mode": mode,  # type: ignore[arg-type]
+                    **kwargs,
+                }
+                if schema_generator is not None:
+                    super_kwargs["schema_generator"] = schema_generator  # type: ignore[assignment]
+
+                schema = super().model_json_schema(**super_kwargs)
+
+                # Remove reasoning from properties and required fields
+                schema.get("properties", {}).pop("reasoning", None)
+                if "required" in schema and "reasoning" in schema["required"]:
+                    schema["required"].remove("reasoning")
+                return schema
+
+            if TYPE_CHECKING:
+                alignment: list[TokenAlignment]
+            else:
+                alignment: list[DynamicTokenAlignment] = Field(
+                    min_length=min_length,
+                    max_length=max_length,
+                )
+
+            @model_validator(mode="after")
+            def _filter_invalid_pairs(
+                self,
+            ) -> "_DynamicTextAlignmentSchemaWithoutReasoning":
+                """Filter out invalid alignment pairs and log warnings."""
+                seen: set[tuple[str, str]] = set()
+                filtered: list[TokenAlignment] = []
+                duplicates_count = 0
+                both_unaligned_count = 0
+
+                for a in self.alignment:
+                    pair = (a.source, a.target)
+
+                    # Check for both-unaligned pairs
+                    if a.source == UNALIGNED_MARKER and a.target == UNALIGNED_MARKER:
+                        both_unaligned_count += 1
+                        logger.warning(
+                            "Filtering out invalid alignment with both source and target as <unaligned>"
+                        )
+                        continue
+
+                    # Check for duplicates
+                    if pair in seen:
+                        duplicates_count += 1
+                        continue
+
+                    seen.add(pair)
+                    filtered.append(a)
+
+                # Log summary if any pairs were filtered
+                if duplicates_count > 0:
+                    logger.warning(
+                        f"Filtered out {duplicates_count} duplicate alignment pair(s)"
+                    )
+                if both_unaligned_count > 0:
+                    logger.warning(
+                        f"Filtered out {both_unaligned_count} both-unaligned pair(s)"
+                    )
+
+                self.alignment = filtered
+                return self
+
+            @classmethod
+            def from_base_schema(
+                cls, base: TextAlignmentSchema
+            ) -> "_DynamicTextAlignmentSchemaWithoutReasoning":
+                """Convert base schema to dynamic schema."""
+                # Convert TokenAlignment objects to TokenAlignment to satisfy typing
+                alignments_list: list[TokenAlignment] = [
+                    TokenAlignment(source=a.source, target=a.target)
+                    for a in base.alignment
+                ]
+                return cls(alignment=alignments_list)
+
+            def to_base_schema(self) -> TextAlignmentSchema:
+                """Convert dynamic schema to base schema."""
+                # Convert DynamicTokenAlignment objects back to TokenAlignment
+                base_alignments = [
+                    TokenAlignment(source=a.source, target=a.target)
+                    for a in self.alignment
+                ]
+                return TextAlignmentSchema(alignment=base_alignments)
+
+        # Assign to common variable name for return
+        DynamicTextAlignmentSchema = _DynamicTextAlignmentSchemaWithoutReasoning  # type: ignore[assignment]
 
     logger.debug(
         "Created dynamic schema:\n%s",

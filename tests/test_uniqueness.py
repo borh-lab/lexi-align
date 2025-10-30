@@ -147,8 +147,6 @@ def test_pharaoh_format_uniqueness():
     assert parsed_target == " ".join(target_tokens)
 
     # Verify alignments are identical after round-trip
-    original_pairs = {(a.source_token, a.target_token) for a in alignment.alignment}
-    parsed_pairs = {
-        (a.source_token, a.target_token) for a in parsed_alignment.alignment
-    }
+    original_pairs = {(a.source, a.target) for a in alignment.alignment}
+    parsed_pairs = {(a.source, a.target) for a in parsed_alignment.alignment}
     assert original_pairs == parsed_pairs

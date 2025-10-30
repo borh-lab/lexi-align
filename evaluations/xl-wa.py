@@ -49,46 +49,12 @@ from lexi_align.text_processing import (
 )
 from lexi_align.utils import (
     create_token_mapping,
-    parse_case_line,  # NEW
+    parse_case_line,
     read_pharaoh_file,
     remove_unique_one,
     validate_token_lists,
 )
 from lexi_align.visualize import visualize_alignments
-
-
-def _accumulate_result(
-    metrics: Optional[Metrics],
-    alignment_data: dict | None,
-    diag: dict[str, Any],
-    counters: dict[str, int],
-    val_err_stats: dict,
-    exception_counts: dict[str, int],
-    alignments_data: list[dict],
-):
-    """
-    Update global counters & storage from one example.
-    counters keys: 'tp','pred','gold','failed','attempts','val_errs'
-    """
-    if metrics and alignment_data:
-        counters["tp"] += metrics["true_positives"]
-        counters["pred"] += metrics["predicted"]
-        counters["gold"] += metrics["gold"]
-        alignments_data.append(alignment_data)
-    else:
-        counters["failed"] += 1
-
-    # merge diagnostics
-    counters["attempts"] += diag["total_attempts"]
-    counters["val_errs"] += diag["total_validation_errors"]
-    for et, stats in diag["validation_error_stats"].items():
-        val_err_stats[et]["count"] += stats["count"]
-        for tok, freq in stats["frequencies"].items():
-            val_err_stats[et]["frequencies"][tok] = (
-                val_err_stats[et]["frequencies"].get(tok, 0) + freq
-            )
-    for exc, cnt in diag["exception_counts"].items():
-        exception_counts[exc] = exception_counts.get(exc, 0) + cnt
 
 
 def _summarize_alignment_result(alignment_result: AlignmentResult) -> dict[str, Any]:
@@ -232,6 +198,11 @@ def setup_logging(verbosity: int = 0):
 
     # Set level for root logger
     logging.root.setLevel(level)
+
+    # Reduce verbosity of noisy third-party libraries
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
+    logging.getLogger("PIL").setLevel(logging.WARNING)
 
 
 class TokenStats(TypedDict):
@@ -964,25 +935,47 @@ def get_run_parameters(args: argparse.Namespace) -> dict:
     """Collect all run parameters into a dictionary."""
     return {
         "model": args.model,
+        "adapter": args.adapter,
         "temperature": args.temperature,
-        "seed": args.seed,
-        "model_seed": args.model_seed,
-        "num_train_examples": args.num_train_examples,
-        "sample_size": args.sample_size,
-        "marker_type": args.marker_type,
-        "use_async": getattr(args, "use_async", False),
+        "max_retries": args.max_retries,
+        "sample_size": getattr(args, "sample_size", None),
+        "use_guidelines": getattr(args, "use_guidelines", True),
+        "use_dynamic_schema": args.adapter_type == "dynamic",
+        "use_reasoning": args.use_reasoning,
+        "batch_size": getattr(args, "batch_size", None),
         "concurrency": getattr(args, "concurrency", None),
+        "num_train_examples": getattr(args, "num_train_examples", None),
+        "visualize": getattr(args, "visualize", False),
+        "visualize_max_examples": getattr(args, "visualize_max_examples", None),
+        # Include sampling parameters if present
+        "top_k": getattr(args, "top_k", None),
+        "top_p": getattr(args, "top_p", None),
+        "beam_size": getattr(args, "beam_size", None),
         "presence_penalty": getattr(args, "presence_penalty", None),
         "min_p": getattr(args, "min_p", None),
+        "max_tokens": getattr(args, "max_tokens", None),
+        "sglang_url": getattr(args, "sglang_url", None),
+        "sglang_api_key": "<redacted>"
+        if getattr(args, "sglang_api_key", None)
+        else None,
+        "seed": getattr(args, "seed", None),
+        "model_seed": getattr(args, "model_seed", None),
+        "marker_type": getattr(args, "marker_type", "subscript"),
     }
 
 
 def get_marker_generator(marker_type: str) -> MarkerGenerator:
     """Get marker generator based on type string."""
+    logger.debug(f"get_marker_generator called with marker_type={marker_type!r}")
+
     if marker_type == "subscript":
-        return create_subscript_generator()
+        gen = create_subscript_generator()
+        logger.debug(f"Created subscript generator: {gen}")
+        return gen
     elif marker_type == "underscore":
-        return create_underscore_generator()
+        gen = create_underscore_generator()
+        logger.debug(f"Created underscore generator: {gen}")
+        return gen
     else:
         raise ValueError(f"Unknown marker type: {marker_type}")
 
@@ -1079,8 +1072,7 @@ def evaluate_language_pair(
 
     logger.info(f"Evaluating {lang_pair}...")
 
-    # Get marker generator based on args
-    marker_generator = get_marker_generator(args.marker_type)
+    marker_generator = get_marker_generator(getattr(args, "marker_type", "subscript"))
 
     training_examples = None
     if args.num_train_examples is not None:
@@ -1151,8 +1143,8 @@ def _process_alignment_result(
 
     # Validate alignment tokens
     is_valid, errors = validate_token_lists(
-        [a.source_token for a in alignment_result.alignment.alignment],
-        [a.target_token for a in alignment_result.alignment.alignment],
+        [a.source for a in alignment_result.alignment.alignment],
+        [a.target for a in alignment_result.alignment.alignment],
         source_mapping,
         target_mapping,
     )
@@ -1252,30 +1244,25 @@ def _evaluate_language_pair_sequential(
             if alignment_data is not None:
                 alignment_data["elapsed_ms"] = round(elapsed_ms, 3)
 
-            counters = {
-                "tp": total_true_positives,
-                "pred": total_predicted,
-                "gold": total_gold,
-                "failed": failed_calls,
-                "attempts": total_attempts,
-                "val_errs": total_validation_errors,
-            }
-            _accumulate_result(
-                metrics,
-                alignment_data,
-                _summarize_alignment_result(alignment_result),
-                counters=counters,
-                val_err_stats=validation_error_stats,
-                exception_counts=exception_counts,
-                alignments_data=alignments_data,
-            )
-            # then unpack counters back
-            total_true_positives = counters["tp"]
-            total_predicted = counters["pred"]
-            total_gold = counters["gold"]
-            failed_calls = counters["failed"]
-            total_attempts = counters["attempts"]
-            total_validation_errors = counters["val_errs"]
+            if metrics and alignment_data:
+                total_true_positives += metrics["true_positives"]
+                total_predicted += metrics["predicted"]
+                total_gold += metrics["gold"]
+                alignments_data.append(alignment_data)
+            else:
+                failed_calls += 1
+
+            diag = _summarize_alignment_result(alignment_result)
+            total_attempts += diag["total_attempts"]
+            total_validation_errors += diag["total_validation_errors"]
+            for et, stats in diag["validation_error_stats"].items():
+                validation_error_stats[et]["count"] += stats["count"]
+                for tok, freq in stats["frequencies"].items():
+                    validation_error_stats[et]["frequencies"][tok] = (
+                        validation_error_stats[et]["frequencies"].get(tok, 0) + freq
+                    )
+            for exc, cnt in diag["exception_counts"].items():
+                exception_counts[exc] = exception_counts.get(exc, 0) + cnt
 
         except Exception as e:
             logger.error(
@@ -1375,25 +1362,42 @@ async def _evaluate_language_pair_sequential_async(
                 f"Unexpected error processing example {idx}:\n"
                 f"  Raw line: {line!r}\n"
                 f"  Error type: {type(e).__name__}\n"
-                f"  Error: {str(e)}"
+                f"  Error: {str(e)}",
+                exc_info=True,
             )
             return (None, None, None)
 
-    # Launch all tasks and show progress as they complete
-    tasks = [process_one(i, line) for i, line in enumerate(test_cases, 1)]
-    results: list[tuple] = []
+    # Launch all tasks and preserve order
+    tasks = [
+        asyncio.create_task(process_one(i, line))
+        for i, line in enumerate(test_cases, 1)
+    ]
+
+    # Track results by original index to preserve order
+    results: list[Optional[tuple]] = [None] * len(tasks)
+    pending = {task: idx for idx, task in enumerate(tasks)}
+
     with tqdm(
         total=len(test_cases),
         desc=f"Processing {lang_pair} (async)",
         dynamic_ncols=True,
         leave=True,
     ) as pbar:
-        for coro in asyncio.as_completed(tasks):
-            results.append(await coro)
-            pbar.update(1)
+        while pending:
+            done, _ = await asyncio.wait(
+                pending.keys(), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                idx = pending.pop(task)
+                results[idx] = await task
+                pbar.update(1)
 
-    # Aggregate
-    for alignment_result, metrics, alignment_data in results:
+    # Aggregate in correct order
+    for result in results:
+        if result is None:
+            continue
+
+        alignment_result, metrics, alignment_data = result
         if alignment_result is not None:
             diag = _summarize_alignment_result(alignment_result)
         else:
@@ -1403,30 +1407,24 @@ async def _evaluate_language_pair_sequential_async(
                 "exception_counts": {},
                 "validation_error_stats": categorize_validation_errors([]),
             }
-        counters = {
-            "tp": total_true_positives,
-            "pred": total_predicted,
-            "gold": total_gold,
-            "failed": failed_calls,
-            "attempts": total_attempts,
-            "val_errs": total_validation_errors,
-        }
-        _accumulate_result(
-            metrics,
-            alignment_data,
-            diag,
-            counters=counters,
-            val_err_stats=validation_error_stats,
-            exception_counts=exception_counts,
-            alignments_data=alignments_data,
-        )
-        # unpack updated counters
-        total_true_positives = counters["tp"]
-        total_predicted = counters["pred"]
-        total_gold = counters["gold"]
-        failed_calls = counters["failed"]
-        total_attempts = counters["attempts"]
-        total_validation_errors = counters["val_errs"]
+        if metrics and alignment_data:
+            total_true_positives += metrics["true_positives"]
+            total_predicted += metrics["predicted"]
+            total_gold += metrics["gold"]
+            alignments_data.append(alignment_data)
+        else:
+            failed_calls += 1
+
+        total_attempts += diag["total_attempts"]
+        total_validation_errors += diag["total_validation_errors"]
+        for et, stats in diag["validation_error_stats"].items():
+            validation_error_stats[et]["count"] += stats["count"]
+            for tok, freq in stats["frequencies"].items():
+                validation_error_stats[et]["frequencies"][tok] = (
+                    validation_error_stats[et]["frequencies"].get(tok, 0) + freq
+                )
+        for exc, cnt in diag["exception_counts"].items():
+            exception_counts[exc] = exception_counts.get(exc, 0) + cnt
 
     final_metrics: MetricsDict = build_final_metrics(
         total_true_positives=total_true_positives,
@@ -1550,30 +1548,28 @@ def _evaluate_language_pair_batch(
                             target_mappings[batch_idx],
                         )
 
-                        counters = {
-                            "tp": total_true_positives,
-                            "pred": total_predicted,
-                            "gold": total_gold,
-                            "failed": failed_calls,
-                            "attempts": total_attempts,
-                            "val_errs": total_validation_errors,
-                        }
-                        _accumulate_result(
-                            metrics,
-                            alignment_data,
-                            _summarize_alignment_result(result),
-                            counters=counters,
-                            val_err_stats=validation_error_stats,
-                            exception_counts=exception_counts,
-                            alignments_data=alignments_data,
-                        )
-                        # then unpack counters back
-                        total_true_positives = counters["tp"]
-                        total_predicted = counters["pred"]
-                        total_gold = counters["gold"]
-                        failed_calls = counters["failed"]
-                        total_attempts = counters["attempts"]
-                        total_validation_errors = counters["val_errs"]
+                        if metrics and alignment_data:
+                            total_true_positives += metrics["true_positives"]
+                            total_predicted += metrics["predicted"]
+                            total_gold += metrics["gold"]
+                            alignments_data.append(alignment_data)
+                        else:
+                            failed_calls += 1
+
+                        diag = _summarize_alignment_result(result)
+                        total_attempts += diag["total_attempts"]
+                        total_validation_errors += diag["total_validation_errors"]
+                        for et, stats in diag["validation_error_stats"].items():
+                            validation_error_stats[et]["count"] += stats["count"]
+                            for tok, freq in stats["frequencies"].items():
+                                validation_error_stats[et]["frequencies"][tok] = (
+                                    validation_error_stats[et]["frequencies"].get(
+                                        tok, 0
+                                    )
+                                    + freq
+                                )
+                        for exc, cnt in diag["exception_counts"].items():
+                            exception_counts[exc] = exception_counts.get(exc, 0) + cnt
 
                     except Exception as e:
                         failed_calls += 1
@@ -1790,9 +1786,37 @@ def main():
         help="Batch size for processing multiple examples at once (if supported by adapter)",
     )
     analyze_parser.add_argument(
+        "--adapter-type",
+        choices=["normal", "dynamic"],
+        default="dynamic",
+        help="Override schema type used by adapters: 'dynamic' uses token-enum constrained schema; 'normal' uses the base schema.",
+    )
+    analyze_parser.add_argument(
         "--max-tokens",
         type=int,
         help="Maximum number of tokens to generate (overrides model-specific defaults)",
+    )
+    analyze_parser.add_argument(
+        "--use-reasoning",
+        action="store_true",
+        help="Request step-by-step reasoning from model before alignment (increases output size)",
+    )
+    analyze_parser.add_argument(
+        "--no-guidelines",
+        dest="use_guidelines",
+        action="store_false",
+        default=True,
+        help="Disable alignment guidelines (enabled by default for XL-WA)",
+    )
+    analyze_parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Generate visualization output (not implemented for XL-WA yet)",
+    )
+    analyze_parser.add_argument(
+        "--visualize-max-examples",
+        type=int,
+        help="Maximum number of examples to visualize (not implemented for XL-WA yet)",
     )
 
     # Export command
@@ -1834,10 +1858,7 @@ def main():
     setup_logging(getattr(args, "verbose", 0))
 
     if args.command == "analyze":
-        # Setup random seed for example selection only
-
-        # Create LLM adapter based on type
-        # Create LLM adapter using the package factory
+        # Create LLM adapter based on type, using the package factory
         backend_map = {
             "litellm": "litellm",
             "outlines": "transformers",
@@ -1846,6 +1867,7 @@ def main():
         }
         backend = backend_map[args.adapter]
         spec = f"{backend}:{args.model}" if args.model else backend
+        use_dynamic_schema = args.adapter_type == "dynamic"
         common_kwargs: dict[str, Any] = {
             "temperature": args.temperature,
             "samples": args.samples,
@@ -1853,6 +1875,8 @@ def main():
             "top_p": args.top_p,
             "beam_size": args.beam_size,
             "max_tokens": args.max_tokens,
+            "use_dynamic_schema": use_dynamic_schema,
+            "use_reasoning": args.use_reasoning,
         }
         if args.adapter == "outlines":
             # Default max tokens for transformers (keep previous behavior)

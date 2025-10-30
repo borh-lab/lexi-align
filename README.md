@@ -3,74 +3,240 @@
 [![PyPI version](https://badge.fury.io/py/lexi-align.svg)](https://badge.fury.io/py/lexi-align)
 [![CI](https://github.com/borh-lab/lexi-align/actions/workflows/ci.yaml/badge.svg)](https://github.com/borh-lab/lexi-align/actions/workflows/ci.yaml)
 
-Word alignment of multilingual sentences using structured generation with Large Language Models.
+Token alignment using structured generation with Large Language Models.
+This library does not do any tokenization, so supports different types of units (words, phrases, etc. arbitrary tokens), as well as language pairs (or monolingual alignment).
 
-## Installation
+The library is API-backend agnostic and only directly depends on [Pydantic](https://docs.pydantic.dev/latest/) and [llm-schema-lite](https://github.com/rohitgarud/llm-schema-lite), so you will need to bring your own API code or use the provided [litellm](https://github.com/BerriAI/litellm) integration.
 
-Install from PyPI:
+## Quick Start
 
-```bash
-pip install lexi-align
-```
-
-(or your favorite method)
-
-The library is API-backend agnostic and only directly depends on [Pydantic](https://docs.pydantic.dev/latest/), so you will need to bring your own API code or use the provided [litellm](https://github.com/BerriAI/litellm) integration.
-
-For LLM support via litellm (recommended), install with the optional dependency:
+### Installation
 
 ```bash
+# For API-based models (OpenAI, Anthropic, Bedrock, Azure, etc.)
 pip install lexi-align[litellm]
-```
 
-Using uv:
-
-```bash
-uv add lexi-align --extra litellm
-```
-
-For LLM support via Outlines (for local models), install with:
-
-```bash
+# OR for local models (HuggingFace Transformers)
 pip install lexi-align[outlines]
-```
 
-Using uv:
-
-```bash
-uv add lexi-align --extra outlines
-```
-
-For LLM support via llama.cpp (for local models), install with:
-
-```bash
+# OR for quantized models (llama.cpp)
 pip install lexi-align[llama]
 ```
 
-Using uv:
+There are other extras for using CUDA/ROCM/CPU PyTorch versions, as well as the `viz` visualization extra.
+Most of these are also available in the `dev` dependency group.
 
-```bash
-uv add lexi-align --extra llama
+### Align Tokens in Two Sentences
+
+```python
+from lexi_align import create_adapter, align_tokens
+
+# Create adapter (uses GPT-4o-mini via LiteLLM)
+adapter = create_adapter("litellm:gpt-4o-mini")
+
+# Your pre-tokenized input
+source = ["The", "cat", "sat"]
+target = ["Le", "chat", "était", "assis"]
+
+# Align
+result = align_tokens(
+    adapter, source, target,
+    source_language="English",
+    target_language="French"
+)
+
+# Use the alignment
+for align in result.alignment.alignment:
+    print(f"{align.source} → {align.target}")
+# Output:
+# The → Le
+# cat → chat
+# sat → était
+# sat → assis
 ```
 
-## Usage
+### Process Multiple Pairs
+
+```python
+from lexi_align import align_many, align_many_async
+
+# Align multiple (source, target) pairs sequentially
+pairs = [
+    (["The", "cat"], ["Le", "chat"]),
+    (["A", "dog"], ["Un", "chien"]),
+]
+
+results = align_many(
+    adapter, pairs,
+    source_language="English",
+    target_language="French"
+)
+
+# Or use async version for concurrent processing
+results = await align_many_async(
+    adapter, pairs,
+    source_language="English",
+    target_language="French",
+    concurrency=8,  # Max concurrent requests
+    show_progress=True
+)
+```
+
+### Align Multiple Sentences (Dataset)
+
+```python
+from lexi_align import create_adapter, align_dataset
+
+adapter = create_adapter("litellm:gpt-4o-mini")
+
+# Your dataset
+sources = [
+    ["The", "cat", "sat"],
+    ["A", "dog", "runs"],
+    # ... more examples
+]
+targets = [
+    ["Le", "chat", "était", "assis"],
+    ["Un", "chien", "court"],
+    # ... more examples
+]
+
+# Automatically uses best strategy (batch/async/sequential)
+results = align_dataset(
+    adapter, sources, targets,
+    source_language="English",
+    target_language="French",
+    show_progress=True  # Shows progress bar
+)
+
+# Check results
+successful = [r for r in results if r.alignment]
+print(f"✓ Aligned {len(successful)}/{len(results)} pairs")
+```
+
+## Choosing an Adapter
+
+| Adapter | Best For | Speed | Example |
+|---------|----------|-------|---------|
+| **litellm** | API models (OpenAI, Anthropic, Azure) | Fast (async) | `create_adapter("litellm:openai/gpt-5-mini")` |
+| **outlines** | Local HuggingFace models | Medium (batched) | `create_adapter("transformers:Qwen/Qwen3-4B-Instruct-2507")` |
+| **llama-cpp** | Quantized GGUF models | Slower (sequential) | `create_adapter("llama:model.gguf")` |
+| **sglang** | SGLang inference server | Fast (batched) | `create_adapter("sglang:Qwen/Qwen3-4B-Instruct-2507")` |
+
+**Note:** LiteLLM and SGLang adapters use a default 15-minute timeout for requests. This can be customized via adapter parameters if needed.
+
+Processing strategies:
+- **Async adapters** (litellm, sglang): Process multiple pairs concurrently for faster throughput
+- **Batch adapters** (outlines, sglang): Process multiple pairs in GPU batches for efficiency
+- **Sequential adapters** (llama-cpp): Process pairs one at a time
+
+## Common Patterns
+
+### Evaluate Against Gold Standard
+
+```python
+from lexi_align import align_and_evaluate_dataset
+
+# Combined alignment and evaluation in one call
+results, metrics = align_and_evaluate_dataset(
+    adapter, sources, targets, gold_alignments,
+    source_language="English",
+    target_language="French",
+    show_progress=True
+)
+
+print(f"Precision: {metrics['micro']['precision']:.3f}")
+print(f"Recall:    {metrics['micro']['recall']:.3f}")
+print(f"F1:        {metrics['micro']['f_measure']:.3f}")
+print(f"AER:       {metrics['micro']['aer']:.3f}")
+
+# Or use separate functions for more control
+from lexi_align import align_dataset, evaluate_alignments
+
+results = align_dataset(adapter, sources, targets)
+predicted = [r.alignment for r in results if r.alignment]
+metrics = evaluate_alignments(predicted, gold_alignments)
+```
+
+### Handle Failures Gracefully
+
+Since performing alignments is side-effecting IO we are not guaranteed to succeed every time, given GPU memory limitation or API outages.
+Each alignment returns information on the successful or unsuccesful state of the alignment.
+
+```python
+for i, result in enumerate(results):
+    if result.alignment:
+        # Success!
+        print(f"✓ Pair {i}: {len(result.alignment.alignment)} alignments")
+    else:
+        # Check diagnostics
+        print(f"✗ Pair {i} failed after {len(result.attempts)} attempts")
+        for attempt in result.attempts:
+            if attempt.validation_errors:
+                print(f"  Validation errors: {attempt.validation_errors[:3]}")
+            if attempt.exception:
+                print(f"  Exception: {attempt.exception}")
+```
+
+### Few-Shot Examples
+
+```python
+from lexi_align.models import TextAlignment, TokenAlignment
+
+# Provide examples
+examples = [
+    (
+        ["The", "cat"],
+        ["Le", "chat"],
+        TextAlignment(alignment=[
+            TokenAlignment(source="The", target="Le"),
+            TokenAlignment(source="cat", target="chat")
+        ])
+    )
+]
+
+# Examples are automatically included in prompts
+results = align_dataset(
+    adapter, sources, targets,
+    examples=examples,
+    source_language="English",
+    target_language="French"
+)
+```
+
+### Custom Guidelines
+
+```python
+guidelines = """
+1. Align content words (nouns, verbs, adjectives) first
+2. Function words should be aligned when they have clear correspondences
+3. Handle idiomatic expressions by aligning all components
+"""
+
+results = align_dataset(
+    adapter, sources, targets,
+    guidelines=guidelines
+)
+```
+
+## Advanced Usage
 
 ### Basic Usage
 
 The library expects pre-tokenized input--it does not perform any tokenization. You must provide tokens as lists of strings:
 
 ```python
-from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
-from lexi_align.core import align_tokens
+from lexi_align import create_adapter, align_tokens
 
-# Initialize the LLM adapter
-llm_adapter = LiteLLMAdapter(model_params={
-    "model": "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
-    "temperature": 0.0
-})
+# Initialize the LLM adapter using the factory
+llm_adapter = create_adapter(
+    "litellm:bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
+    temperature=0.0
+)
 
 # Provide pre-tokenized input with repeated tokens
-source_tokens = ["the", "big", "cat", "saw", "the", "cat"]  # Note: "the" and "cat" appear twice
+source_tokens = ["the", "big", "cat", "saw", "the", "cat"]  # Note: "the" and "cat" appear twice,
+# but this is handled automatically by the library
 target_tokens = ["le", "gros", "chat", "a", "vu", "le", "chat"]
 
 result = align_tokens(
@@ -100,19 +266,18 @@ else:
 # cat₂ -> chat₂
 ```
 
+By default, subscript numbers are added to duplicates to disambiguate alignments.
+
 ### Batched Processing
 
-**EXPERIMENTAL**
-
-For processing multiple sequences efficiently using Outlines (which supports native batching):
+For processing multiple sequences efficiently using adapters that support native batching:
 
 ```python
-from lexi_align.adapters.outlines_adapter import OutlinesAdapter
-from lexi_align.core import align_tokens_batched
+from lexi_align import create_adapter, align_tokens_batched
 
 # Initialize adapter with a local model
-llm_adapter = OutlinesAdapter(
-    model_name="Qwen/Qwen2.5-1.5B-Instruct",  # or any local model path
+llm_adapter = create_adapter(
+    "transformers:Qwen/Qwen3-0.6B",
     dtype="bfloat16",  # optional: choose quantization
     device="cuda"      # optional: specify device
 )
@@ -147,20 +312,17 @@ for result in results:
 
 ### Async Processing
 
-**EXPERIMENTAL**
-
 For asynchronous processing:
 
 ```python
 import asyncio
-from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
-from lexi_align.core import align_tokens_async
+from lexi_align import create_adapter, align_tokens_async
 
 async def align_async():
-    llm_adapter = LiteLLMAdapter(model_params={
-        "model": "gpt-4o",
-        "temperature": 0.0
-    })
+    llm_adapter = create_adapter(
+        "litellm:gpt-5-nano",
+        temperature=0.3
+    )
 
     source = ["The", "cat", "sat"]
     target = ["Le", "chat", "assis"]
@@ -223,15 +385,14 @@ Use the above code as a guide to examine the errors.
 You can provide custom alignment guidelines and examples to improve alignment quality:
 
 ```python
-from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
-from lexi_align.core import align_tokens
+from lexi_align import create_adapter, align_tokens
 from lexi_align.models import TextAlignment, TokenAlignment
 
-# Initialize adapter as before
-llm_adapter = LiteLLMAdapter(model_params={
-    "model": "gpt-4o",
-    "temperature": 0.0
-})
+# Initialize adapter using the factory
+llm_adapter = create_adapter(
+    "litellm:gpt-5-mini",
+    temperature=0.0
+)
 
 # Define custom guidelines
 guidelines = """
@@ -321,18 +482,26 @@ print(unique_tokens)  # ['the_1', 'cat', 'the_2', 'mat']
 
 ### Dynamic Schema Generation
 
-The library supports dynamic JSON schema generation and uses it both as an enforcement mechanism and as explicit prompt guidance. Adapters that can pass a schema to the backend/generator (Outlines, SGLang, LlamaCpp via Outlines integration) use a dynamic schema to enforce token enums and alignment-length constraints server-side. Remote/backends that cannot enforce schemas themselves (e.g., litellm) can optionally request schema-validated responses by enabling use_dynamic_schema=True (pass use_dynamic_schema to create_adapter or instantiate LiteLLMAdapter with use_dynamic_schema=True). Additionally, some adapters (LiteLLMAdapter and SGLangAdapter) embed the schema JSON in the system prompt by default (include_schema=True) so the model receives explicit, machine-readable guidance even when the API cannot validate responses.
+The library supports dynamic JSON schema generation and uses it both as an enforcement mechanism and as explicit prompt guidance. Adapters that can pass a schema to the backend/generator (Outlines, SGLang, LlamaCpp via Outlines integration) use a dynamic schema to enforce token enums and alignment-length constraints server-side.
+Remote/backends that cannot enforce schemas themselves (e.g., litellm) can optionally request schema-validated responses by enabling `use_dynamic_schema=True`.
+Additionally, some adapters (LiteLLMAdapter and SGLangAdapter) embed the schema JSON in the system prompt by default so the model receives explicit, machine-readable guidance even when the API cannot validate responses.
 
 ```python
-from lexi_align.adapters.outlines_adapter import OutlinesAdapter
-from lexi_align.core import align_tokens
+from lexi_align import create_adapter, align_tokens
 
-# Initialize adapter - supports dynamic schema by default
-llm_adapter = OutlinesAdapter(
-    model_name="Qwen/Qwen2.5-1.5B-Instruct",
+# Initialize adapter with dynamic schema enabled
+llm_adapter = create_adapter(
+    "transformers:Qwen/Qwen3-4B-Instruct-2507",
     dtype="bfloat16",
     device="cuda",
-    batch_size=5  # Enable efficient batching
+    batch_size=4,  # Enable efficient batching
+    use_dynamic_schema=True  # Enable schema validation
+)
+
+# For LiteLLM (API-based), enable schema validation:
+llm_adapter = create_adapter(
+    "litellm:gpt-5-nano",
+    use_dynamic_schema=True  # Request schema-validated responses
 )
 
 # The library automatically:
@@ -367,6 +536,11 @@ The dynamic schema:
 - Provides clear error messages for invalid alignments
 - Supports partial alignments with retries
 
+**Adapter-specific behavior:**
+- **Outlines/SGLang/LlamaCpp**: Enforce schema server-side for guaranteed valid JSON
+- **LiteLLM**: By default embeds schema in prompt for guidance; pass `use_dynamic_schema=True` to request validation
+- All adapters: Include schema in system prompt by default for explicit model guidance
+
 ### Logging
 
 The library uses Python's standard `logging` module. To see detailed logs, including debug messages, configure the logger for the `lexi_align` namespace:
@@ -390,18 +564,21 @@ from lexi_align.core import align_tokens
 For running local models with llama.cpp:
 
 ```python
-from lexi_align.adapters.llama_cpp_adapter import LlamaCppAdapter
-from lexi_align.core import align_tokens
+from lexi_align import create_adapter, align_tokens
 
 # Initialize the llama.cpp adapter with a local model
-llm_adapter = LlamaCppAdapter(
-    model_path="path/to/model.gguf",
-    n_gpu_layers=-1,  # Use GPU acceleration
+llm_adapter = create_adapter(
+    "llama:path/to/model.gguf",
+    n_gpu_layers=-1  # Use GPU acceleration
 )
 
 # Note that for some GGUF models the pre-tokenizer might fail,
-# in which case you can specify the tokenizer_repo_id, which
-# should point to the base model's repo_id on Huggingface.
+# in which case you can specify the tokenizer_repo_id parameter:
+llm_adapter = create_adapter(
+    "llama:path/to/model.gguf",
+    n_gpu_layers=-1,
+    repo_id="base-model-repo-id"  # HuggingFace repo for tokenizer
+)
 
 # Use the same API as with other adapters
 alignment = align_tokens(
@@ -506,7 +683,7 @@ python evaluations/xl-wa.py \
 # Full evaluation with custom parameters using a local Transformers model
 python evaluations/xl-wa.py \
     --lang-pairs EN-FR EN-DE \
-    --model transformers:Qwen3-0.6B \
+    --model transformers:Qwen/Qwen3-0.6B \
     --temperature 0.0 \
     --seed 42 \
     --num-train-examples 3 \
@@ -608,3 +785,5 @@ Run tests:
 ```bash
 pytest
 ```
+
+Scripts are provided in the `scripts/` directory for linting and running tests in one go.

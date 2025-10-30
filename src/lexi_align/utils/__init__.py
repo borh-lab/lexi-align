@@ -3,10 +3,20 @@ import unicodedata as ud
 from logging import getLogger
 from typing import Any, List, Literal, Optional, Tuple, Type, Union, cast
 
+from llm_schema_lite import loads as llm_loads
 from pydantic import BaseModel
 
-from lexi_align.models import (
+from lexi_align.constants import (
+    REMAINING_SOURCE_PREFIX,
+    REMAINING_TARGET_PREFIX,
+    SOURCE_TOKENS_PREFIX,
+    TARGET_TOKENS_PREFIX,
     UNALIGNED_MARKER,
+)
+from lexi_align.models import (
+    ChatMessageDict as ModelChatMessageDict,
+)
+from lexi_align.models import (
     TextAlignment,
     TextAlignmentSchema,
     TokenAlignment,
@@ -16,17 +26,15 @@ from lexi_align.models import (
     create_token_mapping,
     make_unique,
 )
-from lexi_align.models import (
-    ChatMessageDict as ModelChatMessageDict,
-)
 from lexi_align.text_processing import (
     MarkerGenerator,
     create_subscript_generator,
     remove_unique_one,
 )
 
+from .common import get_default_marker_generator
+
 logger = getLogger(__name__)
-DEFAULT_SUBSCRIPT = create_subscript_generator()
 
 
 class SystemMessage:
@@ -91,9 +99,10 @@ def to_text_alignment(obj: Any) -> TextAlignment:
     if isinstance(obj, TextAlignmentSchema):
         return TextAlignment(alignment=obj.alignment)
     if isinstance(obj, dict):
-        return TextAlignment.model_validate(obj)
+        return TextAlignment.model_validate(obj, strict=True)
     if isinstance(obj, str):
-        return TextAlignment.model_validate_json(obj)
+        data = llm_loads(obj, mode="json")
+        return TextAlignment.model_validate(data, strict=True)
     raise TypeError(f"Cannot convert object of type {type(obj)} to TextAlignment")
 
 
@@ -190,13 +199,22 @@ def extract_tokens_and_retry_flag(
 
         if not source_tokens or not target_tokens:
             lines = [ln.strip() for ln in content.splitlines()]
-            st = next((ln for ln in lines if ln.startswith("source_tokens: ")), None)
-            tt = next((ln for ln in lines if ln.startswith("target_tokens: ")), None)
+            st = next((ln for ln in lines if ln.startswith(SOURCE_TOKENS_PREFIX)), None)
+            tt = next((ln for ln in lines if ln.startswith(TARGET_TOKENS_PREFIX)), None)
             if st and tt:
-                source_tokens = st.split("source_tokens: ", 1)[1].split()
-                target_tokens = tt.split("target_tokens: ", 1)[1].split()
-                # continue scanning for a possible retry marker in later messages already seen
-                # but since we scan from last to first, is_retry is already set when present
+                # Add validation for split operation
+                st_parts = st.split(SOURCE_TOKENS_PREFIX, 1)
+                tt_parts = tt.split(TARGET_TOKENS_PREFIX, 1)
+
+                if len(st_parts) == 2 and st_parts[1].strip():
+                    source_tokens = st_parts[1].split()
+                else:
+                    logger.warning(f"Invalid source token format: {st}")
+
+                if len(tt_parts) == 2 and tt_parts[1].strip():
+                    target_tokens = tt_parts[1].split()
+                else:
+                    logger.warning(f"Invalid target token format: {tt}")
 
         if source_tokens and target_tokens and is_retry:
             break
@@ -231,9 +249,53 @@ def extract_existing_alignments_from_messages(
             continue
         m = pattern.search(content)
         if not m:
+            # Fallback: locate cue and try balanced-braces extraction
+            cue = "Here are partial alignments:"
+            idx = content.find(cue)
+            if idx != -1:
+                brace_start = content.find("{", idx)
+                if brace_start != -1:
+                    depth = 0
+                    end = -1
+                    for i, ch in enumerate(content[brace_start:], start=brace_start):
+                        if ch == "{":
+                            depth += 1
+                        elif ch == "}":
+                            depth -= 1
+                            if depth == 0:
+                                end = i + 1
+                                break
+                    if end != -1:
+                        candidate = content[brace_start:end]
+                        try:
+                            data = llm_loads(candidate, mode="json")
+                            ta = TextAlignment.model_validate(data, strict=True)
+                            return ta.alignment
+                        except Exception:
+                            pass
+                # Fallback 2: fenced code block ```json ... ```
+                fence_start = content.find("```", idx)
+                if fence_start != -1:
+                    fence_end = content.find("```", fence_start + 3)
+                    if fence_end != -1:
+                        block = content[fence_start + 3 : fence_end].strip()
+                        # Strip optional language tag (e.g., 'json')
+                        first_nl = block.find("\n")
+                        if first_nl > 0 and block[:first_nl].strip().lower() in {
+                            "json",
+                            "jsonc",
+                        }:
+                            block = block[first_nl + 1 :].strip()
+                        try:
+                            data = llm_loads(block, mode="json")
+                            ta = TextAlignment.model_validate(data, strict=True)
+                            return ta.alignment
+                        except Exception:
+                            pass
             continue
         try:
-            ta = TextAlignment.model_validate_json(m.group(1))
+            data = llm_loads(m.group(1), mode="json")
+            ta = TextAlignment.model_validate(data, strict=True)
             return ta.alignment
         except Exception:
             return None
@@ -273,7 +335,7 @@ def remove_unique(tokens: list[str]) -> list[str]:
         >>> remove_unique(["cat₁", "the₂", "normal"])
         ['cat', 'the', 'normal']
     """
-    marker_generator = DEFAULT_SUBSCRIPT  # Cached default marker generator
+    marker_generator = get_default_marker_generator()
     return [remove_unique_one(token, marker_generator.pattern) for token in tokens]
 
 
@@ -300,7 +362,7 @@ def normalize_tokens(
         ['the', 'cat', 'the']
     """
     if marker_pattern is None:
-        marker_pattern = DEFAULT_SUBSCRIPT.pattern
+        marker_pattern = get_default_marker_generator().pattern
     return [remove_unique_one(token, marker_pattern) for token in tokens]
 
 
@@ -363,33 +425,126 @@ def validate_token_lists(
     return (not errors, errors)
 
 
+def extract_remaining_tokens_from_messages(
+    messages: list[dict],
+) -> tuple[Optional[list[str]], Optional[list[str]]]:
+    """Extract remaining source/target tokens listed in retry prompts, if present.
+
+    Returns:
+        (remaining_source_tokens, remaining_target_tokens) or (None, None) if not found.
+
+    Example:
+        >>> msgs = [
+        ...     {"role": "user", "content": "remaining_source_tokens: the₁ cat\\nremaining_target_tokens: le₁ chat"}
+        ... ]
+        >>> extract_remaining_tokens_from_messages(msgs)
+        (['the₁', 'cat'], ['le₁', 'chat'])
+        >>> msgs = [{"role": "user", "content": "remaining_source_tokens: the₁"}]
+        >>> extract_remaining_tokens_from_messages(msgs)
+        (['the₁'], None)
+    """
+    rem_src: Optional[list[str]] = None
+    rem_tgt: Optional[list[str]] = None
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            continue
+        lines = [ln.strip() for ln in content.splitlines()]
+        st = next((ln for ln in lines if ln.startswith(REMAINING_SOURCE_PREFIX)), None)
+        tt = next((ln for ln in lines if ln.startswith(REMAINING_TARGET_PREFIX)), None)
+
+        # Add validation for split operations
+        if st:
+            st_parts = st.split(REMAINING_SOURCE_PREFIX, 1)
+            if len(st_parts) == 2 and st_parts[1].strip():
+                rem_src = st_parts[1].split()
+            else:
+                logger.warning(f"Invalid remaining source token format: {st}")
+
+        if tt:
+            tt_parts = tt.split(REMAINING_TARGET_PREFIX, 1)
+            if len(tt_parts) == 2 and tt_parts[1].strip():
+                rem_tgt = tt_parts[1].split()
+            else:
+                logger.warning(f"Invalid remaining target token format: {tt}")
+
+        if rem_src is not None or rem_tgt is not None:
+            break
+    return rem_src, rem_tgt
+
+
 def select_alignment_schema(
     source_tokens: list[str],
     target_tokens: list[str],
     min_alignments: int = 0,
     is_retry: bool = False,
     existing_alignments: Optional[List[TokenAlignment]] = None,
+    remaining_source_tokens: Optional[list[str]] = None,
+    remaining_target_tokens: Optional[list[str]] = None,
+    use_reasoning: bool = False,
 ) -> Type[TextAlignmentSchema]:
     """
-    Choose a dynamic alignment schema with retry-aware max_length.
+    Choose a dynamic alignment schema with retry-aware max_length and an
+    effective minimum length based on token counts and already-aligned items.
+
+    On first attempt the default minimum is max(#source_tokens, #target_tokens).
+    On retry, if existing_alignments is provided, the default minimum is the
+    number of remaining source/target tokens that still need alignment.
+    If the caller provides a positive min_alignments, it is honored; otherwise
+    the computed default is used. The effective minimum is clamped to [0, max_length].
     """
-    if is_retry and existing_alignments:
-        aligned_source = {
-            a.source for a in existing_alignments if a.source != UNALIGNED_MARKER
-        }
-        aligned_target = {
-            a.target for a in existing_alignments if a.target != UNALIGNED_MARKER
-        }
-        remaining_source = list(set(source_tokens) - aligned_source)
-        remaining_target = list(set(target_tokens) - aligned_target)
-        max_len = calculate_max_alignments(remaining_source, remaining_target)
+    # Determine "remaining" tokens. Prefer explicit lists from the retry prompt,
+    # else fall back to subtracting already-used tokens from existing_alignments.
+    if is_retry:
+        if remaining_source_tokens is not None or remaining_target_tokens is not None:
+            rem_src = list(remaining_source_tokens or [])
+            rem_tgt = list(remaining_target_tokens or [])
+        elif existing_alignments:
+            aligned_source = {
+                a.source for a in existing_alignments if a.source != UNALIGNED_MARKER
+            }
+            aligned_target = {
+                a.target for a in existing_alignments if a.target != UNALIGNED_MARKER
+            }
+            # Compute remaining tokens deterministically (preserve order)
+            rem_src = [t for t in source_tokens if t not in aligned_source]
+            rem_tgt = [t for t in target_tokens if t not in aligned_target]
+        else:
+            rem_src = list(source_tokens)
+            rem_tgt = list(target_tokens)
+        if len(rem_src) == 0 and len(rem_tgt) == 0:
+            # Nothing left to align: force empty alignment
+            max_len = 0
+            default_min = 0
+        else:
+            max_len = calculate_max_alignments(rem_src, rem_tgt)
+            default_min = max(len(rem_src), len(rem_tgt))
     else:
+        rem_src = list(source_tokens)
+        rem_tgt = list(target_tokens)
         max_len = calculate_max_alignments(source_tokens, target_tokens)
+        default_min = max(len(source_tokens), len(target_tokens))
+
+    # If caller provided a positive min_alignments, honor it; otherwise use default_min
+    eff_min = (
+        int(min_alignments) if (min_alignments and min_alignments > 0) else default_min
+    )
+    # Clamp to [0, max_len]
+    eff_min = min(max(0, eff_min), max_len)
+
+    # Always use full token lists for schema - the prompt will guide which tokens to align
+    enum_src = source_tokens
+    enum_tgt = target_tokens
+
     return create_dynamic_alignment_schema(
-        source_tokens,
-        target_tokens,
-        min_length=min_alignments or 0,
+        enum_src,
+        enum_tgt,
+        min_length=eff_min,
         max_length=max_len,
+        tokens_are_uniquified=True,  # tokens from messages are already uniquified
+        use_reasoning=use_reasoning,
     )
 
 

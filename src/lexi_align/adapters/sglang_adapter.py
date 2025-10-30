@@ -8,17 +8,15 @@ import openai
 from outlines import Generator, from_sglang  # type: ignore
 
 from lexi_align.adapters import LLMAdapter
+from lexi_align.constants import (
+    DEFAULT_MAX_LOG_CHARS,
+    TEMPERATURE_INCREMENT_PER_RETRY,
+)
 from lexi_align.models import (
     TextAlignment,
     TextAlignmentSchema,
-    TokenAlignment,
 )
-from lexi_align.utils import (
-    extract_existing_alignments_from_messages,
-    extract_tokens_and_retry_flag,
-    select_alignment_schema,
-    to_text_alignment,
-)
+from lexi_align.utils.common import filter_none_values
 
 logger = getLogger(__name__)
 
@@ -61,6 +59,8 @@ class SGLangAdapter(LLMAdapter):
         min_p: Optional[float] = None,
         min_alignments: Optional[int] = 0,
         json_retry_attempts: int = 3,
+        use_dynamic_schema: bool = True,
+        use_reasoning: bool = False,
     ):
         """Initialize SGLang adapter.
 
@@ -79,6 +79,7 @@ class SGLangAdapter(LLMAdapter):
             extra_body: SGLang-specific parameters passed under 'extra_body'
             presence_penalty: Optional presence penalty forwarded to SGLang/OpenAI
             min_p: Optional minimum probability mass forwarded to SGLang/OpenAI
+            use_reasoning: Whether to include reasoning field in responses
         """
         self.base_url = base_url
         self.api_key = api_key or "not-needed"
@@ -96,6 +97,12 @@ class SGLangAdapter(LLMAdapter):
 
         self._client_kwargs = client_kwargs or {}
 
+        # Set default timeout to 15 minutes if not specified
+        if "timeout" not in self._client_kwargs:
+            import httpx
+
+            self._client_kwargs["timeout"] = httpx.Timeout(900.0)  # 15 minutes
+
         # OpenAI clients (sync/async)
         self._sync_client = openai.OpenAI(
             base_url=self.base_url, api_key=self.api_key, **self._client_kwargs
@@ -109,8 +116,9 @@ class SGLangAdapter(LLMAdapter):
         self._amodel: Optional[Any] = None
 
         self.include_schema = True  # Include JSON Schema in prompt by default
-        self.min_alignments = min_alignments or 0
-        self.json_retry_attempts = json_retry_attempts
+        self._init_common_params(
+            min_alignments, use_dynamic_schema, json_retry_attempts, use_reasoning
+        )
 
     @property
     def model(self):
@@ -132,51 +140,89 @@ class SGLangAdapter(LLMAdapter):
 
     def supports_length_constraints(self) -> bool:
         """SGLang supports dynamic schema length constraints via Outlines."""
-        return True
+        return self.use_dynamic_schema
 
-    def _get_schema_class(
+    def _build_client_args(
         self,
-        source_tokens: list[str],
-        target_tokens: list[str],
-        is_retry: bool = False,
-        existing_alignments: Optional[List[TokenAlignment]] = None,
-    ) -> Type[TextAlignmentSchema]:
-        """Select dynamic schema with length constraints (mirrors OutlinesAdapter)."""
-        return select_alignment_schema(
-            source_tokens,
-            target_tokens,
-            min_alignments=self.min_alignments or 0,
-            is_retry=is_retry,
-            existing_alignments=existing_alignments,
+        messages: list["ChatMessageDict"],
+        schema_class: Type[TextAlignmentSchema],
+        seed: Optional[int],
+        base_seed: int,
+    ) -> tuple[Dict[str, Any], int]:
+        """Build request arguments for OpenAI client (shared by sync/async).
+
+        Returns:
+            Tuple of (client_args dict, attempt_idx)
+        """
+        schema_json = schema_class.model_json_schema()
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_json.get("title", "DynamicTextAlignmentSchema"),
+                "schema": schema_json,
+                "strict": True,
+            },
+        }
+
+        client_args: Dict[str, Any] = {
+            "model": self.model_id,
+            "messages": cast(List[Dict[str, Any]], messages),
+            "response_format": response_format,
+            **self._inference_kwargs(),
+        }
+
+        if self.max_tokens is not None:
+            client_args["max_tokens"] = self.max_tokens
+        if seed is not None:
+            client_args["seed"] = seed
+
+        # Increase temperature by TEMPERATURE_INCREMENT_PER_RETRY per retry attempt
+        attempt_idx = 0
+        if seed is not None:
+            try:
+                attempt_idx = max(0, int(seed) - int(base_seed) - 1)
+            except Exception:
+                attempt_idx = 0
+        base_temp = float(client_args.get("temperature", self.temperature or 0.0))
+        client_args["temperature"] = (
+            base_temp + TEMPERATURE_INCREMENT_PER_RETRY * attempt_idx
         )
+
+        # Debug logging for max_tokens
+        logger.info(
+            f"SGLang client_args max_tokens: {client_args.get('max_tokens', 'NOT SET')}, "
+            f"self.max_tokens: {self.max_tokens}"
+        )
+        logger.debug(f"Full SGLang client_args keys: {list(client_args.keys())}")
+        logger.debug(
+            f"Full SGLang client_args: {str(client_args)}"
+        )  # Truncate for readability
+
+        return client_args, attempt_idx
 
     def _inference_kwargs(self) -> Dict[str, Any]:
         """Build kwargs forwarded to OpenAI Chat Completions (SGLang)."""
-        kwargs: Dict[str, Any] = {}
+        # OpenAI-supported arguments with None filtering
+        kwargs = filter_none_values(
+            {
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "presence_penalty": getattr(self, "presence_penalty", None),
+            }
+        )
 
-        # OpenAI-supported arguments
-        kwargs["temperature"] = self.temperature
-        if self.top_p is not None:
-            kwargs["top_p"] = self.top_p
-        if getattr(self, "presence_penalty", None) is not None:
-            kwargs["presence_penalty"] = self.presence_penalty
         # Map samples -> n (OpenAI-compatible)
         if getattr(self, "samples", None) is not None and int(self.samples) > 1:
             kwargs["n"] = int(self.samples)
 
         # Collect SGLang-specific params into extra_body
-        extra_body: Dict[str, Any] = {}
-        if self.extra_body:
-            extra_body.update(self.extra_body)
+        extra_body: Dict[str, Any] = dict(self.extra_body) if self.extra_body else {}
 
-        if self.top_k is not None:
-            extra_body.setdefault("top_k", self.top_k)
-        if self.beam_size is not None:
-            extra_body.setdefault("beam_size", self.beam_size)
-        if getattr(self, "min_p", None) is not None:
-            extra_body.setdefault("min_p", self.min_p)
+        for key in ("top_k", "beam_size", "min_p"):
+            if (val := getattr(self, key, None)) is not None:
+                extra_body.setdefault(key, val)
 
-        # Hoist known SGLang keys from generation_kwargs into extra_body
+        # Hoist known SGLang keys from generation_kwargs
         gen = dict(self.generation_kwargs or {})
         for k in ("top_k", "beam_size", "min_p"):
             if k in gen and k not in extra_body:
@@ -185,46 +231,46 @@ class SGLangAdapter(LLMAdapter):
         if extra_body:
             kwargs["extra_body"] = extra_body
 
-        # Remaining generation kwargs (OpenAI-recognized ones can stay top-level)
+        # Remaining generation kwargs
         kwargs.update(gen)
         return kwargs
 
     def __call__(self, messages: list["ChatMessageDict"]) -> TextAlignment:
         """Generate alignments using the SGLang model through OpenAI chat.completions."""
-        # Extract tokens and retry state
-        source_tokens, target_tokens, is_retry = extract_tokens_and_retry_flag(
-            cast(List[Dict[str, Any]], messages)
-        )
-        existing_alignments = extract_existing_alignments_from_messages(
-            cast(List[Dict[str, Any]], messages)
-        )
-        schema_class = self._get_schema_class(
-            source_tokens, target_tokens, is_retry, existing_alignments
-        )
-        schema_json = schema_class.model_json_schema()
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_json.get("title", "DynamicTextAlignmentSchema"),
-                "schema": schema_json,
-            },
-        }
+        schema_class = self._select_schema_for_messages(messages)
         base_seed = int((self.generation_kwargs or {}).get("seed", 0) or 0)
 
         def _gen(seed: Optional[int]) -> TextAlignment:
-            client_args: Dict[str, Any] = {
-                "model": self.model_id,
-                "messages": cast(List[Dict[str, Any]], messages),
-                "response_format": response_format,
-                **self._inference_kwargs(),
-            }
-            if self.max_tokens is not None:
-                client_args["max_tokens"] = self.max_tokens
-            if seed is not None:
-                client_args["seed"] = seed
+            client_args, attempt_idx = self._build_client_args(
+                messages, schema_class, seed, base_seed
+            )
+            logger.debug(
+                "SGLangAdapter sync call",
+                extra={
+                    "attempt_idx": attempt_idx,
+                    "seed": seed,
+                    "temperature": client_args["temperature"],
+                },
+            )
             resp = self._sync_client.chat.completions.create(**client_args)
             content = resp.choices[0].message.content
-            return to_text_alignment(content)
+            content = content.strip() if isinstance(content, str) else str(content)
+            logger.debug(f"SGLang response content: {content}")
+            logger.debug(f"SGLang response content length: {len(content)}")
+            return self._validate_response_content(
+                content,
+                schema_class,
+                context={
+                    "seed": seed,
+                    "mode": "sync",
+                    "model": self.model_id,
+                    "max_log_chars": int(
+                        (self.generation_kwargs or {}).get(
+                            "log_max_chars", DEFAULT_MAX_LOG_CHARS
+                        )
+                    ),
+                },
+            )
 
         try:
             return self._retry_on_invalid_json(
@@ -233,44 +279,52 @@ class SGLangAdapter(LLMAdapter):
                 base_seed=base_seed,
             )
         except Exception as e:
-            logger.error(f"SGLangAdapter call failed: {type(e).__name__}: {e}")
+            logger.error(
+                "SGLangAdapter call failed",
+                extra={"error_type": type(e).__name__, "model": self.model_id},
+                exc_info=True,
+            )
+            logger.error(f"Exception details: {str(e)}")
+            if hasattr(e, "__cause__") and e.__cause__:
+                logger.error(f"Caused by: {str(e.__cause__)}")
             raise
 
     async def acall(self, messages: list["ChatMessageDict"]) -> TextAlignment:
         """Async generation using OpenAI Async client with SGLang."""
-        source_tokens, target_tokens, is_retry = extract_tokens_and_retry_flag(
-            cast(List[Dict[str, Any]], messages)
-        )
-        existing_alignments = extract_existing_alignments_from_messages(
-            cast(List[Dict[str, Any]], messages)
-        )
-        schema_class = self._get_schema_class(
-            source_tokens, target_tokens, is_retry, existing_alignments
-        )
-        schema_json = schema_class.model_json_schema()
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_json.get("title", "DynamicTextAlignmentSchema"),
-                "schema": schema_json,
-            },
-        }
+        schema_class = self._select_schema_for_messages(messages)
         base_seed = int((self.generation_kwargs or {}).get("seed", 0) or 0)
 
         async def _agen(seed: Optional[int]) -> TextAlignment:
-            client_args: Dict[str, Any] = {
-                "model": self.model_id,
-                "messages": cast(List[Dict[str, Any]], messages),
-                "response_format": response_format,
-                **self._inference_kwargs(),
-            }
-            if self.max_tokens is not None:
-                client_args["max_tokens"] = self.max_tokens
-            if seed is not None:
-                client_args["seed"] = seed
+            client_args, attempt_idx = self._build_client_args(
+                messages, schema_class, seed, base_seed
+            )
+            logger.debug(
+                "SGLangAdapter async call",
+                extra={
+                    "attempt_idx": attempt_idx,
+                    "seed": seed,
+                    "temperature": client_args["temperature"],
+                },
+            )
             resp = await self._async_client.chat.completions.create(**client_args)
             content = resp.choices[0].message.content
-            return to_text_alignment(content)
+            content = content.strip() if isinstance(content, str) else str(content)
+            logger.debug(f"SGLang async response content: {content}")
+            logger.debug(f"SGLang async response content length: {len(content)}")
+            return self._validate_response_content(
+                content,
+                schema_class,
+                context={
+                    "seed": seed,
+                    "mode": "async",
+                    "model": self.model_id,
+                    "max_log_chars": int(
+                        (self.generation_kwargs or {}).get(
+                            "log_max_chars", DEFAULT_MAX_LOG_CHARS
+                        )
+                    ),
+                },
+            )
 
         try:
             return await self._retry_on_invalid_json_async(
@@ -279,7 +333,14 @@ class SGLangAdapter(LLMAdapter):
                 base_seed=base_seed,
             )
         except Exception as e:
-            logger.error(f"SGLangAdapter async call failed: {type(e).__name__}: {e}")
+            logger.error(
+                "SGLangAdapter async call failed",
+                extra={"error_type": type(e).__name__, "model": self.model_id},
+                exc_info=True,
+            )
+            logger.error(f"Async exception details: {str(e)}")
+            if hasattr(e, "__cause__") and e.__cause__:
+                logger.error(f"Caused by: {str(e.__cause__)}")
             raise
 
     def batch(
@@ -292,50 +353,15 @@ class SGLangAdapter(LLMAdapter):
         Returns:
             A list where each element is a TextAlignment or None if an item failed.
         """
-        # Format inputs and select schemas per example
-        inputs: list[list["ChatMessageDict"]] = []
-        schema_classes: list[Type[TextAlignmentSchema]] = []
 
-        for messages in batch_messages:
-            try:
-                source_tokens, target_tokens, is_retry = extract_tokens_and_retry_flag(
-                    cast(List[Dict[str, Any]], messages)
-                )
-                existing_alignments = extract_existing_alignments_from_messages(
-                    cast(List[Dict[str, Any]], messages)
-                )
-                schema_class = self._get_schema_class(
-                    source_tokens, target_tokens, is_retry, existing_alignments
-                )
-            except ValueError:
-                logger.warning(f"Could not find tokens in messages: {messages}")
-                schema_class = TextAlignmentSchema
+        def process_one(
+            messages: list["ChatMessageDict"], schema_class: Type[TextAlignmentSchema]
+        ) -> Any:
+            """Process a single message sequence with its schema."""
+            gen = Generator(self.model, schema_class)
+            gen_kwargs = self._inference_kwargs()
+            if self.max_tokens is not None:
+                gen_kwargs["max_tokens"] = self.max_tokens
+            return gen(messages, **gen_kwargs)
 
-            schema_classes.append(schema_class)
-            inputs.append(messages)
-
-        # Process inputs with their corresponding schemas
-        batch_results: list[Optional[TextAlignment]] = []
-        for i, (msgs, schema_class) in enumerate(zip(inputs, schema_classes)):
-            try:
-                gen = Generator(self.model, schema_class)
-                gen_kwargs = self._inference_kwargs()
-                if self.max_tokens is not None:
-                    gen_kwargs["max_tokens"] = self.max_tokens
-                result = gen(msgs, **gen_kwargs)
-                ta = to_text_alignment(result)
-                if ta.alignment:
-                    batch_results.append(ta)
-                else:
-                    logger.error("Received empty alignment from SGLangAdapter in batch")
-                    batch_results.append(None)
-            except Exception as e:
-                logger.error(
-                    f"Error processing input {i}:\n"
-                    f"Error type: {type(e).__name__}\n"
-                    f"Error message: {str(e)}\n",
-                    exc_info=True,
-                )
-                batch_results.append(None)
-
-        return batch_results
+        return self._batch_with_per_item_schema(batch_messages, process_one)

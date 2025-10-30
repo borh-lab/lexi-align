@@ -1,5 +1,7 @@
 from lexi_align.adapters import LLMAdapter, create_adapter
 from lexi_align.core import (
+    align_and_evaluate_dataset,
+    align_dataset,
     align_many,
     align_many_async,
     align_tokens,
@@ -8,6 +10,7 @@ from lexi_align.core import (
     align_tokens_raw,
     align_tokens_raw_async,
     build_alignment_messages,
+    evaluate_alignments,
     summarize_result,
 )
 from lexi_align.metrics import calculate_metrics
@@ -38,10 +41,13 @@ __all__ = [
     "align_tokens_batched",
     "align_tokens_raw",
     "align_tokens_raw_async",
+    "align_dataset",
+    "align_and_evaluate_dataset",
     "build_alignment_messages",
     "align_many",
     "align_many_async",
     "summarize_result",
+    "evaluate_alignments",
     # models
     "TextAlignment",
     "TokenAlignment",

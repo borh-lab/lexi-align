@@ -328,8 +328,8 @@ def test_batch_partial_failures():
     assert results[2].alignment is not None
 
     # Verify successful alignments
-    assert results[0].alignment.alignment[0].source_token == "test0"
-    assert results[2].alignment.alignment[0].source_token == "test2"
+    assert results[0].alignment.alignment[0].source == "test0"
+    assert results[2].alignment.alignment[0].source == "test2"
 
     # Verify failed alignment attempts
     assert len(results[1].attempts) > 0

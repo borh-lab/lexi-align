@@ -14,8 +14,8 @@ def validate_alignment_tokens(
     alignment: TextAlignment, src_tokens: list[str], tgt_tokens: list[str]
 ):
     """Helper function to validate alignment tokens."""
-    src_aligned = {align.source_token for align in alignment.alignment}
-    tgt_aligned = {align.target_token for align in alignment.alignment}
+    src_aligned = {align.source for align in alignment.alignment}
+    tgt_aligned = {align.target for align in alignment.alignment}
     assert src_aligned.issubset(set(src_tokens)), (
         f"Aligned source tokens {src_aligned} not subset of input tokens {set(src_tokens)}"
     )
