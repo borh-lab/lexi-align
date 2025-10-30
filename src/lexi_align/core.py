@@ -1539,8 +1539,8 @@ def align_dataset(
         List of AlignmentResult objects
 
     Example:
-        >>> from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
-        >>> adapter = LiteLLMAdapter(model_params={"model": "gpt-4o-mini"})
+        >>> from lexi_align.adapters.outlines_adapter import OutlinesAdapter
+        >>> adapter = OutlinesAdapter("Qwen/Qwen3-0.6B")
         >>> source = [["The", "cat"], ["A", "dog"]]
         >>> target = [["Le", "chat"], ["Un", "chien"]]
         >>> results = align_dataset(adapter, source, target, show_progress=False)
@@ -1684,9 +1684,9 @@ def align_and_evaluate_dataset(
         Tuple of (alignment_results, metrics_dict)
 
     Example:
-        >>> from lexi_align.adapters.litellm_adapter import LiteLLMAdapter
+        >>> from lexi_align.adapters.outlines_adapter import OutlinesAdapter
         >>> from lexi_align.models import TextAlignment, TokenAlignment
-        >>> adapter = LiteLLMAdapter(model_params={"model": "gpt-4o-mini"})
+        >>> adapter = OutlinesAdapter("Qwen/Qwen3-0.6B")
         >>> sources = [["The", "cat"], ["A", "dog"]]
         >>> targets = [["Le", "chat"], ["Un", "chien"]]
         >>> gold = [
