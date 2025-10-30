@@ -14,6 +14,7 @@ from lexi_align.models import AlignmentResult, TextAlignment, TokenAlignment
 logger = getLogger(__name__)
 
 
+@pytest.mark.llm
 @pytest.mark.skipif(
     "TEST_LLM_MODEL" not in os.environ,
     reason="TEST_LLM_MODEL environment variable not set",
@@ -85,6 +86,7 @@ def test_litellm_adapter():
     logger.info(f"Alignment metrics: {metrics}")
 
 
+@pytest.mark.llm
 @pytest.mark.skipif(
     "TEST_LLM_MODEL" not in os.environ,
     reason="TEST_LLM_MODEL environment variable not set",
