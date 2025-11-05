@@ -236,7 +236,6 @@ class LLMAdapter(RetryMixin, ABC):
         from llm_schema_lite import loads as llm_loads
         from llm_schema_lite import validate as llm_validate
 
-
         context = context or {}
         try:
             # Use lenient parser first to handle malformed JSON
@@ -249,6 +248,7 @@ class LLMAdapter(RetryMixin, ABC):
             err_list: list[str] = errors or []
             if is_valid:
                 from lexi_align.models import TextAlignment
+
                 return TextAlignment.model_validate(data)
 
             # Try partial extraction via Pydantic to salvage valid items on length errors

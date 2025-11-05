@@ -97,7 +97,9 @@ def to_text_alignment(obj: Any) -> TextAlignment:
     if isinstance(obj, TextAlignment):
         return obj
     if isinstance(obj, TextAlignmentSchema):
-        return TextAlignment(alignment=obj.alignment, reasoning=getattr(obj, "reasoning", None))
+        return TextAlignment(
+            alignment=obj.alignment, reasoning=getattr(obj, "reasoning", None)
+        )
     if isinstance(obj, dict):
         return TextAlignment.model_validate(obj, strict=True)
     if isinstance(obj, str):
