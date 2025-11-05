@@ -2,7 +2,7 @@
 
 import pytest
 
-from lexi_align.adapters import create_adapter, LLMAdapter
+from lexi_align.adapters import LLMAdapter, create_adapter
 
 
 def test_create_adapter_litellm_string():

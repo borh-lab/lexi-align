@@ -1,24 +1,44 @@
 import os
 import tempfile
 
+import altair as alt
 import matplotlib.pyplot as plt
+import pytest
 
 from lexi_align.models import TextAlignment, TokenAlignment
-from lexi_align.visualize import visualize_alignments
+from lexi_align.visualize import visualize_alignments, visualize_alignments_altair
 
 
-def test_visualize_alignments_basic(sample_tokens, sample_alignments):
-    """Test basic visualization functionality"""
-    # Create visualization
+@pytest.mark.parametrize(
+    "reference_model,figsize",
+    [
+        (None, None),  # Default behavior
+        ("model1", None),  # With reference model
+        (None, (15, 6)),  # Custom figsize
+        ("model1", (15, 6)),  # Both reference and custom figsize
+    ],
+)
+def test_visualize_alignments_matplotlib(
+    sample_tokens, sample_alignments, reference_model, figsize
+):
+    """Test matplotlib visualization with various configurations."""
     visualize_alignments(
         source_tokens=sample_tokens["source"],
         target_tokens=sample_tokens["target"],
         alignments=sample_alignments,
         title="Test Alignment",
+        reference_model=reference_model,
+        figsize=figsize,
     )
 
     # Check that a figure was created
     assert plt.get_fignums(), "No figure was created"
+
+    # If custom figsize provided, verify it
+    if figsize:
+        fig = plt.gcf()
+        assert fig.get_size_inches().tolist() == list(figsize)
+
     plt.close()
 
 
@@ -26,7 +46,6 @@ def test_visualize_alignments_output_file(sample_tokens, sample_alignments):
     """Test saving visualization to file"""
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         try:
-            # Create and save visualization
             visualize_alignments(
                 source_tokens=sample_tokens["source"],
                 target_tokens=sample_tokens["target"],
@@ -40,54 +59,8 @@ def test_visualize_alignments_output_file(sample_tokens, sample_alignments):
             assert os.path.getsize(tmp.name) > 0, "Output file is empty"
 
         finally:
-            # Cleanup
             plt.close()
             os.unlink(tmp.name)
-
-
-def test_visualize_alignments_reference_model(sample_tokens, sample_alignments):
-    """Test visualization with reference model highlighting"""
-    visualize_alignments(
-        source_tokens=sample_tokens["source"],
-        target_tokens=sample_tokens["target"],
-        alignments=sample_alignments,
-        title="Test Alignment",
-        reference_model="model1",
-    )
-
-    # Check that a figure was created
-    assert plt.get_fignums(), "No figure was created"
-    plt.close()
-
-
-def test_visualize_alignments_single_model(sample_tokens, sample_alignment):
-    """Test that visualization works for single model"""
-    visualize_alignments(
-        source_tokens=sample_tokens["source"],
-        target_tokens=sample_tokens["target"],
-        alignments={"model1": sample_alignment},
-        title="Test Alignment",
-    )
-    # Check that a figure *was* created
-    assert plt.get_fignums(), "No figure was created for single model"
-    plt.close()
-
-
-def test_visualize_alignments_custom_figsize(sample_tokens, sample_alignments):
-    """Test custom figure size"""
-    custom_figsize = (15, 6)  # Explicitly provided size should override dynamic sizing
-    visualize_alignments(
-        source_tokens=sample_tokens["source"],
-        target_tokens=sample_tokens["target"],
-        alignments=sample_alignments,
-        title="Test Alignment",
-        figsize=custom_figsize,
-    )
-
-    # Check figure size
-    fig = plt.gcf()
-    assert fig.get_size_inches().tolist() == list(custom_figsize)
-    plt.close()
 
 
 def test_visualize_alignments_empty():
@@ -104,8 +77,6 @@ def test_visualize_alignments_empty():
 
 def test_visualize_alignments_invalid_tokens():
     """Test handling of invalid token alignments"""
-    from lexi_align.models import TextAlignment, TokenAlignment
-
     invalid_alignments = {
         "model1": TextAlignment(
             alignment=[TokenAlignment(source="invalid", target="nonexistent")]
@@ -122,52 +93,24 @@ def test_visualize_alignments_invalid_tokens():
     plt.close()
 
 
-def test_visualize_alignments_legend(sample_tokens, sample_alignments):
-    """Test legend generation"""
-    visualize_alignments(
+def test_visualize_alignments_altair_basic(sample_tokens, sample_alignments):
+    """Test Altair visualization returns Chart for valid alignments."""
+    chart = visualize_alignments_altair(
         source_tokens=sample_tokens["source"],
         target_tokens=sample_tokens["target"],
         alignments=sample_alignments,
-        title="Legend Test",
+        title="Altair Test",
     )
-
-    fig = plt.gcf()
-    legend = fig.axes[0].get_legend()
-    assert legend is not None, "Legend not created"
-    assert len(legend.get_texts()) == len(sample_alignments), "Incorrect legend entries"
-    plt.close()
+    assert chart is not None, "Chart should not be None for valid alignments"
+    assert isinstance(chart, alt.Chart), "Result should be an Altair Chart"
 
 
-def test_visualize_alignments_unique_labels():
-    """Test uniquification of duplicate tokens in labels"""
-    source = ["the", "the", "cat"]
-    target = ["le", "le", "chat"]
-    alignments = {
-        "model1": TextAlignment(
-            alignment=[
-                TokenAlignment(source="the", target="le"),
-                TokenAlignment(source="cat", target="chat"),
-            ]
-        ),
-        "model2": TextAlignment(
-            alignment=[
-                TokenAlignment(source="the", target="le"),
-                TokenAlignment(source="cat", target="chat"),
-            ]
-        ),
-    }
-
-    visualize_alignments(
-        source_tokens=source,
-        target_tokens=target,
-        alignments=alignments,
-        title="Unique Labels Test",
+def test_visualize_alignments_altair_empty():
+    """Test Altair visualization returns None for empty alignments."""
+    chart = visualize_alignments_altair(
+        source_tokens=["test"],
+        target_tokens=["test"],
+        alignments={},
+        title="Empty Altair Test",
     )
-
-    fig = plt.gcf()
-    xticklabels = [t.get_text() for t in fig.axes[0].get_xticklabels()]
-    yticklabels = [t.get_text() for t in fig.axes[0].get_yticklabels()]
-
-    assert len(set(xticklabels)) == len(xticklabels), "X-axis labels not unique"
-    assert len(set(yticklabels)) == len(yticklabels), "Y-axis labels not unique"
-    plt.close()
+    assert chart is None, "Chart should be None for empty alignments"

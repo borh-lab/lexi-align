@@ -294,9 +294,7 @@ class OutlinesAdapter(LLMAdapter):
         return self._batch_size
 
     async def acall(self, messages: list["ChatMessageDict"]) -> TextAlignment:
-        raise NotImplementedError(
-            "OutlinesAdapter does not support async; use the synchronous API."
-        )
+        return await super().acall(messages)
 
     def __call__(self, messages: list["ChatMessageDict"]) -> TextAlignment:
         """Generate alignments using the Outlines model."""

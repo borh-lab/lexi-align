@@ -16,7 +16,7 @@ from lexi_align.models import (
     TextAlignment,
     TextAlignmentSchema,
 )
-from lexi_align.utils.common import filter_none_values
+from lexi_align.utils.common import filter_none_values, redact_for_logging
 
 logger = getLogger(__name__)
 
@@ -195,8 +195,8 @@ class SGLangAdapter(LLMAdapter):
         )
         logger.debug(f"Full SGLang client_args keys: {list(client_args.keys())}")
         logger.debug(
-            f"Full SGLang client_args: {str(client_args)}"
-        )  # Truncate for readability
+            f"Full SGLang client_args (redacted): {redact_for_logging(client_args)}"
+        )
 
         return client_args, attempt_idx
 

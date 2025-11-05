@@ -28,6 +28,19 @@ def calculate_metrics(
 
     Example:
         >>> from lexi_align.models import TextAlignment, TokenAlignment
+        >>> # Perfect match
+        >>> pred = TextAlignment(alignment=[
+        ...     TokenAlignment(source="the", target="le"),
+        ...     TokenAlignment(source="cat", target="chat")
+        ... ])
+        >>> gold = TextAlignment(alignment=[
+        ...     TokenAlignment(source="the", target="le"),
+        ...     TokenAlignment(source="cat", target="chat")
+        ... ])
+        >>> metrics = calculate_metrics(pred, gold)
+        >>> metrics['precision'], metrics['recall'], metrics['f_measure'], metrics['aer']
+        (1.0, 1.0, 1.0, 0.0)
+        >>> # Partial match: predicted has 2/3 correct
         >>> pred = TextAlignment(alignment=[
         ...     TokenAlignment(source="the", target="le"),
         ...     TokenAlignment(source="cat", target="chat")
@@ -44,6 +57,24 @@ def calculate_metrics(
         Recall: 0.67
         >>> print(f"AER: {metrics['aer']:.2f}")
         AER: 0.20
+        >>> # No match
+        >>> pred = TextAlignment(alignment=[
+        ...     TokenAlignment(source="the", target="chat"),
+        ...     TokenAlignment(source="cat", target="le")
+        ... ])
+        >>> gold = TextAlignment(alignment=[
+        ...     TokenAlignment(source="the", target="le"),
+        ...     TokenAlignment(source="cat", target="chat")
+        ... ])
+        >>> metrics = calculate_metrics(pred, gold)
+        >>> metrics['precision'], metrics['recall'], metrics['f_measure']
+        (0.0, 0.0, 0.0)
+        >>> # Both empty
+        >>> pred = TextAlignment(alignment=[])
+        >>> gold = TextAlignment(alignment=[])
+        >>> metrics = calculate_metrics(pred, gold)
+        >>> metrics['precision'], metrics['recall'], metrics['aer']
+        (0.0, 0.0, 1.0)
     """
     # Convert alignments to sets of pairs
     A = {(a.source, a.target) for a in predicted.alignment}

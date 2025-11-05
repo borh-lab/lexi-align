@@ -18,7 +18,7 @@ def _create_litellm_adapter(model: str, params: dict[str, Any]) -> LLMAdapter:
     """Create LiteLLM adapter."""
     from .litellm_adapter import LiteLLMAdapter
 
-    model_params = params.pop("model_params", {})
+    model_params = dict(params.get("model_params") or {})
     if model and "model" not in model_params:
         model_params["model"] = model
     if not model_params.get("model"):

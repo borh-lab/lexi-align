@@ -1,5 +1,4 @@
 import asyncio
-import json
 from abc import ABC, abstractmethod
 from logging import getLogger
 from typing import (
@@ -22,6 +21,15 @@ if TYPE_CHECKING:
     from lexi_align.models import ChatMessageDict, TextAlignment, TextAlignmentSchema
 
 logger = getLogger(__name__)
+
+
+class SchemaValidationError(Exception):
+    """Raised when llm_schema_lite.validate reports schema errors."""
+
+    def __init__(self, errors: list[str], content_length: Optional[int] = None):
+        super().__init__("SchemaValidationError")
+        self.errors = errors
+        self.content_length = content_length
 
 
 class AdapterCapabilities(TypedDict):
@@ -190,6 +198,9 @@ class LLMAdapter(RetryMixin, ABC):
             # Validate individual items without length constraints
             # Use the base schema which doesn't have length constraints
             partial_data = {"alignment": alignment_items}
+            reasoning_text = data.get("reasoning")
+            if isinstance(reasoning_text, str) and reasoning_text.strip():
+                partial_data["reasoning"] = reasoning_text
             partial_schema = TextAlignmentSchema.model_validate(partial_data)
 
             logger.info(
@@ -219,31 +230,41 @@ class LLMAdapter(RetryMixin, ABC):
             Validated TextAlignment object
 
         Raises:
-            Exception: If validation fails
+            SchemaValidationError: If schema validation fails
+            Exception: If other validation fails
         """
         from llm_schema_lite import loads as llm_loads
+        from llm_schema_lite import validate as llm_validate
 
-        from lexi_align.utils import to_text_alignment
 
         context = context or {}
         try:
-            # Use lenient parser first to handle malformed JSON, then validate with Pydantic
+            # Use lenient parser first to handle malformed JSON
             data = llm_loads(content, mode="json")
-            schema_obj = schema_class.model_validate(data)
-            return to_text_alignment(schema_obj)
-        except Exception as e:
-            # Try to extract partial results on length constraint errors
-            partial = self._extract_partial_alignment_from_error(
-                content, e, schema_class
-            )
-            if partial:
-                logger.warning(
-                    f"{self.__class__.__name__}: Returning partial alignment, "
-                    f"will retry for remaining items"
-                )
-                return partial
 
-            # Original error logging
+            # Multi-error schema validation (no exceptions)
+            is_valid, errors = llm_validate(
+                cast(Any, schema_class), data, return_all_errors=True
+            )
+            err_list: list[str] = errors or []
+            if is_valid:
+                from lexi_align.models import TextAlignment
+                return TextAlignment.model_validate(data)
+
+            # Try partial extraction via Pydantic to salvage valid items on length errors
+            try:
+                schema_class.model_validate(data)
+            except PydanticValidationError as pe:
+                partial = self._extract_partial_alignment_from_error(
+                    content, pe, schema_class
+                )
+                if partial:
+                    logger.warning(
+                        f"{self.__class__.__name__}: Returning partial alignment from schema length error, will retry for remaining items"
+                    )
+                    return partial
+
+            # Log and raise SchemaValidationError with detailed messages
             max_chars = context.get("max_log_chars", 4000)
             snippet = (
                 content[:max_chars]
@@ -252,6 +273,21 @@ class LLMAdapter(RetryMixin, ABC):
                 else content
             )
             logger.error(
+                f"{self.__class__.__name__} schema validation failed",
+                extra={"content_length": len(content), **context},
+            )
+            logger.debug(f"Failed content: {snippet}")
+            for err in err_list:
+                logger.error(f"Schema error: {err}")
+
+            raise SchemaValidationError(err_list, len(content))
+
+        except SchemaValidationError:
+            # Bubble up structured schema errors for retry feedback
+            raise
+        except Exception as e:
+            # Original fallback path (non-schema errors)
+            logger.error(
                 f"{self.__class__.__name__} validation failed",
                 extra={
                     "error_type": type(e).__name__,
@@ -259,14 +295,9 @@ class LLMAdapter(RetryMixin, ABC):
                     **context,
                 },
             )
-            logger.debug(f"Failed content: {snippet}")
             logger.error(f"Full validation error: {str(e)}")
-            logger.error(f"Schema class: {schema_class.__name__}")
             if isinstance(e, PydanticValidationError):
                 logger.error("Pydantic validation errors", extra={"errors": e.errors()})
-                logger.error(
-                    f"Detailed Pydantic errors:\n{json.dumps(e.errors(), indent=2, default=str)}"
-                )
             raise
 
     def _batch_with_per_item_schema(

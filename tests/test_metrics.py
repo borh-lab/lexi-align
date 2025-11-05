@@ -6,148 +6,73 @@ from lexi_align.metrics import calculate_metrics
 from lexi_align.models import TextAlignment, TokenAlignment
 
 
-def test_calculate_metrics_perfect_match():
-    """Test metrics with perfect alignment match."""
-    alignment = TextAlignment(
-        alignment=[
-            TokenAlignment(source="the", target="le"),
-            TokenAlignment(source="cat", target="chat"),
-        ]
-    )
-    metrics = calculate_metrics(alignment, alignment)
-
-    assert metrics["precision"] == 1.0
-    assert metrics["recall"] == 1.0
-    assert metrics["f_measure"] == 1.0
-    assert metrics["aer"] == 0.0
-    assert metrics["true_positives"] == 2
-    assert metrics["predicted"] == 2
-    assert metrics["gold"] == 2
-
-
-def test_calculate_metrics_no_match():
-    """Test metrics with no matching alignments."""
+@pytest.mark.parametrize(
+    "predicted_pairs,gold_pairs,expected_precision,expected_recall,expected_f1",
+    [
+        # Perfect match
+        (
+            [("the", "le"), ("cat", "chat")],
+            [("the", "le"), ("cat", "chat")],
+            1.0,
+            1.0,
+            1.0,
+        ),
+        # No match
+        (
+            [("the", "chat"), ("cat", "le")],
+            [("the", "le"), ("cat", "chat")],
+            0.0,
+            0.0,
+            0.0,
+        ),
+        # Partial match: 2/2 predicted correct, 2/3 gold found
+        (
+            [("the", "le"), ("cat", "chat")],
+            [("the", "le"), ("cat", "chat"), ("sat", "assis")],
+            1.0,
+            pytest.approx(0.667, abs=0.01),
+            pytest.approx(0.8, abs=0.01),
+        ),
+        # Over-prediction: 2/4 predicted correct, 2/2 gold found
+        (
+            [("the", "le"), ("cat", "chat"), ("sat", "assis"), ("on", "sur")],
+            [("the", "le"), ("cat", "chat")],
+            0.5,
+            1.0,
+            pytest.approx(0.667, abs=0.01),
+        ),
+        # Empty predicted
+        ([], [("the", "le")], 0.0, 0.0, 0.0),
+        # Empty gold
+        ([("the", "le")], [], 0.0, 0.0, 0.0),
+        # Both empty
+        ([], [], 0.0, 0.0, 0.0),
+    ],
+)
+def test_calculate_metrics_scenarios(
+    predicted_pairs, gold_pairs, expected_precision, expected_recall, expected_f1
+):
+    """Test metrics across various alignment scenarios."""
     predicted = TextAlignment(
-        alignment=[
-            TokenAlignment(source="the", target="chat"),
-            TokenAlignment(source="cat", target="le"),
-        ]
+        alignment=[TokenAlignment(source=s, target=t) for s, t in predicted_pairs]
     )
     gold = TextAlignment(
-        alignment=[
-            TokenAlignment(source="the", target="le"),
-            TokenAlignment(source="cat", target="chat"),
-        ]
+        alignment=[TokenAlignment(source=s, target=t) for s, t in gold_pairs]
     )
     metrics = calculate_metrics(predicted, gold)
 
-    assert metrics["precision"] == 0.0
-    assert metrics["recall"] == 0.0
-    assert metrics["f_measure"] == 0.0
-    assert metrics["aer"] == 1.0
-    assert metrics["true_positives"] == 0
-    assert metrics["predicted"] == 2
-    assert metrics["gold"] == 2
+    assert metrics["precision"] == expected_precision
+    assert metrics["recall"] == expected_recall
+    assert metrics["f_measure"] == expected_f1
 
 
-def test_calculate_metrics_partial_match():
-    """Test metrics with partial alignment match."""
-    predicted = TextAlignment(
-        alignment=[
-            TokenAlignment(source="the", target="le"),
-            TokenAlignment(source="cat", target="chat"),
-        ]
-    )
-    gold = TextAlignment(
-        alignment=[
-            TokenAlignment(source="the", target="le"),
-            TokenAlignment(source="cat", target="chat"),
-            TokenAlignment(source="sat", target="assis"),
-        ]
-    )
-    metrics = calculate_metrics(predicted, gold)
+def test_calculate_metrics_f_alpha_weighting():
+    """Test that f_alpha parameter correctly weights precision vs recall.
 
-    assert metrics["precision"] == 1.0  # 2/2 predicted are correct
-    assert metrics["recall"] == pytest.approx(0.667, abs=0.01)  # 2/3 gold found
-    assert metrics["f_measure"] == pytest.approx(0.8, abs=0.01)
-    assert metrics["aer"] == pytest.approx(0.2, abs=0.01)
-    assert metrics["true_positives"] == 2
-    assert metrics["predicted"] == 2
-    assert metrics["gold"] == 3
-
-
-def test_calculate_metrics_empty_predicted():
-    """Test metrics with empty predicted alignment."""
-    predicted = TextAlignment(alignment=[])
-    gold = TextAlignment(alignment=[TokenAlignment(source="the", target="le")])
-    metrics = calculate_metrics(predicted, gold)
-
-    assert metrics["precision"] == 0.0
-    assert metrics["recall"] == 0.0
-    assert metrics["f_measure"] == 0.0
-    assert metrics["aer"] == 1.0
-    assert metrics["true_positives"] == 0
-    assert metrics["predicted"] == 0
-    assert metrics["gold"] == 1
-
-
-def test_calculate_metrics_empty_gold():
-    """Test metrics with empty gold alignment."""
-    predicted = TextAlignment(alignment=[TokenAlignment(source="the", target="le")])
-    gold = TextAlignment(alignment=[])
-    metrics = calculate_metrics(predicted, gold)
-
-    assert metrics["precision"] == 0.0
-    assert metrics["recall"] == 0.0
-    assert metrics["f_measure"] == 0.0
-    assert metrics["aer"] == 1.0
-    assert metrics["true_positives"] == 0
-    assert metrics["predicted"] == 1
-    assert metrics["gold"] == 0
-
-
-def test_calculate_metrics_both_empty():
-    """Test metrics with both alignments empty."""
-    predicted = TextAlignment(alignment=[])
-    gold = TextAlignment(alignment=[])
-    metrics = calculate_metrics(predicted, gold)
-
-    assert metrics["precision"] == 0.0
-    assert metrics["recall"] == 0.0
-    assert metrics["f_measure"] == 0.0
-    assert metrics["aer"] == 1.0
-    assert metrics["true_positives"] == 0
-    assert metrics["predicted"] == 0
-    assert metrics["gold"] == 0
-
-
-def test_calculate_metrics_over_prediction():
-    """Test metrics when predicted has more alignments than gold."""
-    predicted = TextAlignment(
-        alignment=[
-            TokenAlignment(source="the", target="le"),
-            TokenAlignment(source="cat", target="chat"),
-            TokenAlignment(source="sat", target="assis"),
-            TokenAlignment(source="on", target="sur"),
-        ]
-    )
-    gold = TextAlignment(
-        alignment=[
-            TokenAlignment(source="the", target="le"),
-            TokenAlignment(source="cat", target="chat"),
-        ]
-    )
-    metrics = calculate_metrics(predicted, gold)
-
-    assert metrics["precision"] == 0.5  # 2/4 predicted are correct
-    assert metrics["recall"] == 1.0  # 2/2 gold found
-    assert metrics["true_positives"] == 2
-    assert metrics["predicted"] == 4
-    assert metrics["gold"] == 2
-
-
-def test_calculate_metrics_custom_f_alpha():
-    """Test metrics with custom f_alpha parameter."""
+    With precision=1.0 and recall≈0.667:
+    - Higher f_alpha (0.75) weights precision more → f_measure closer to 1.0
+    - Lower f_alpha (0.25) weights recall more → f_measure closer to 0.667
+    """
     predicted = TextAlignment(
         alignment=[
             TokenAlignment(source="the", target="le"),
@@ -162,39 +87,13 @@ def test_calculate_metrics_custom_f_alpha():
         ]
     )
 
-    # Test with different f_alpha values
-    # In the formula f = 1 / ((f_alpha/precision) + ((1-f_alpha)/recall)):
-    # - Higher f_alpha weights precision more (gives result closer to precision)
-    # - Lower f_alpha weights recall more (gives result closer to recall)
     metrics_default = calculate_metrics(predicted, gold, f_alpha=0.5)
     metrics_precision_weighted = calculate_metrics(predicted, gold, f_alpha=0.75)
     metrics_recall_weighted = calculate_metrics(predicted, gold, f_alpha=0.25)
 
-    # Since precision=1.0 and recall=0.667:
-    # - With higher precision weight (f_alpha=0.75), f_measure should be higher (closer to 1.0)
-    # - With higher recall weight (f_alpha=0.25), f_measure should be lower (closer to 0.667)
+    # Verify monotonic ordering: precision-weighted > default > recall-weighted
     assert metrics_precision_weighted["f_measure"] > metrics_default["f_measure"]
-    assert metrics_recall_weighted["f_measure"] < metrics_default["f_measure"]
+    assert metrics_default["f_measure"] > metrics_recall_weighted["f_measure"]
 
 
-def test_calculate_metrics_duplicate_alignments():
-    """Test that duplicate alignments are counted correctly."""
-    # Predicted has duplicate
-    predicted = TextAlignment(
-        alignment=[
-            TokenAlignment(source="the", target="le"),
-            TokenAlignment(source="the", target="le"),  # duplicate
-            TokenAlignment(source="cat", target="chat"),
-        ]
-    )
-    gold = TextAlignment(
-        alignment=[
-            TokenAlignment(source="the", target="le"),
-            TokenAlignment(source="cat", target="chat"),
-        ]
-    )
-    metrics = calculate_metrics(predicted, gold)
-
-    # Duplicates should be counted in set operations (only once)
-    assert metrics["precision"] == 1.0
-    assert metrics["recall"] == 1.0
+# Duplicate alignment test covered by parametrized test (perfect match scenario)

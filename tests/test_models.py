@@ -3,14 +3,13 @@
 import pytest
 
 from lexi_align.models import (
-    TokenAlignment,
-    TextAlignment,
-    calculate_max_alignments,
-    create_token_mapping,
-    make_unique,
-    create_dynamic_alignment_schema,
-    SpecialTokens,
     UNALIGNED_MARKER,
+    SpecialTokens,
+    TextAlignment,
+    TokenAlignment,
+    calculate_max_alignments,
+    create_dynamic_alignment_schema,
+    create_token_mapping,
 )
 
 
@@ -20,79 +19,6 @@ def test_calculate_max_alignments():
     assert calculate_max_alignments(["a"], ["x"]) == 2
     assert calculate_max_alignments(["a", "b", "c"], ["x"]) == 5
     assert calculate_max_alignments([], []) == 1  # minimum of 1
-
-
-def test_token_mapping_basic():
-    """Test basic TokenMapping functionality."""
-    tokens = ["the", "cat", "the", "mat"]
-    mapping = create_token_mapping(tokens)
-
-    assert mapping.original == tokens
-    assert mapping.uniquified == ["the₁", "cat", "the₂", "mat"]
-
-    # Test position lookup
-    assert mapping.get_position("the₁") == 0
-    assert mapping.get_position("cat") == 1
-    assert mapping.get_position("the₂") == 2
-    assert mapping.get_position("mat") == 3
-
-    # Test get_uniquified
-    assert mapping.get_uniquified("the") == "the₁"
-    assert mapping.get_uniquified("cat") == "cat"
-
-
-def test_token_mapping_normalized():
-    """Test TokenMapping with normalized lookups."""
-    tokens = ["the", "cat", "the"]
-    mapping = create_token_mapping(tokens)
-
-    # With normalized=True (default), removes markers
-    assert mapping.get_position("the", normalized=True) == 0
-    assert mapping.get_position("the₁", normalized=True) == 0
-    assert mapping.get_position("the₂", normalized=True) == 2
-
-    # With normalized=False, needs exact match
-    assert mapping.get_position("the₁", normalized=False) == 0
-    assert mapping.get_position("the", normalized=False) == -1  # no exact match
-
-
-def test_token_mapping_not_found():
-    """Test TokenMapping returns -1 for missing tokens."""
-    tokens = ["cat", "dog"]
-    mapping = create_token_mapping(tokens)
-
-    assert mapping.get_position("bird") == -1
-    assert mapping.get_position("bird₁") == -1
-
-
-def test_make_unique_no_duplicates():
-    """Test make_unique with no duplicates."""
-    tokens = ["the", "cat", "sat"]
-    assert make_unique(tokens) == tokens
-
-
-def test_make_unique_multiple_duplicates():
-    """Test make_unique with multiple occurrences."""
-    tokens = ["the", "the", "the", "cat"]
-    result = make_unique(tokens)
-    assert result == ["the₁", "the₂", "the₃", "cat"]
-
-
-def test_make_unique_with_existing_markers():
-    """Test make_unique strips existing markers first."""
-    tokens = ["the₁", "the₂", "the₁"]
-    result = make_unique(tokens)
-    # Should strip markers and re-apply
-    assert result == ["the₁", "the₂", "the₃"]
-
-
-def test_make_unique_type_errors():
-    """Test make_unique type validation."""
-    with pytest.raises(TypeError, match="Input must be a list"):
-        make_unique("not a list")  # type: ignore
-
-    with pytest.raises(TypeError, match="All tokens must be strings"):
-        make_unique([1, 2, 3])  # type: ignore
 
 
 def test_text_alignment_equality():

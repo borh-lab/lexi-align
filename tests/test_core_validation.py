@@ -1,17 +1,17 @@
 """Test alignment validation functions."""
 
+from lexi_align.constants import UNALIGNED_MARKER
 from lexi_align.core import (
+    _create_retry_message,
+    _validate_alignment,
     categorize_validation_errors,
     normalize_validation_errors,
-    _validate_alignment,
-    _create_retry_message,
 )
 from lexi_align.models import (
     TextAlignment,
     TokenAlignment,
     ValidationErrorType,
 )
-from lexi_align.constants import UNALIGNED_MARKER
 
 
 def test_categorize_validation_errors_single_type():

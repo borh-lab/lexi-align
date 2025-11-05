@@ -9,7 +9,6 @@ import polars as pl
 import seaborn as sns  # type: ignore
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
-
 from pyfonts import load_google_font, set_default_font  # type: ignore[import-untyped]
 
 from lexi_align.models import TextAlignment
@@ -359,6 +358,34 @@ def visualize_alignments_altair(
     """
     Altair‐based scatterplot of token alignments.
     Returns an Altair Chart (or saves it as HTML if output_path ends in .html).
+
+    Args:
+        source_tokens: List of source language tokens
+        target_tokens: List of target language tokens
+        alignments: Dictionary mapping model names to TextAlignment objects
+        title: Title for the chart
+        output_path: Optional path to save as HTML
+
+    Returns:
+        Altair Chart object if alignments exist, None otherwise
+
+    Example:
+        >>> from lexi_align.models import TextAlignment, TokenAlignment
+        >>> source = ["The", "cat"]
+        >>> target = ["Le", "chat"]
+        >>> alignments = {
+        ...     "model1": TextAlignment(alignment=[
+        ...         TokenAlignment(source="The", target="Le"),
+        ...         TokenAlignment(source="cat", target="chat")
+        ...     ])
+        ... }
+        >>> chart = visualize_alignments_altair(source, target, alignments, "Test")
+        >>> chart is not None
+        True
+        >>> # Empty alignments return None
+        >>> empty_chart = visualize_alignments_altair(source, target, {}, "Empty")
+        >>> empty_chart is None
+        True
     """
     # Recreate the mappings and uniquified tokens:
     source_map = create_token_mapping(source_tokens)

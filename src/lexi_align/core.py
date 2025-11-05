@@ -1,3 +1,4 @@
+import re
 from asyncio import run as asyncio_run
 from logging import getLogger
 from typing import (
@@ -15,6 +16,7 @@ from llm_schema_lite import simplify_schema
 from tqdm import tqdm
 
 from lexi_align.adapters import LLMAdapter
+from lexi_align.adapters.base import SchemaValidationError
 from lexi_align.constants import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_CONCURRENCY,
@@ -75,6 +77,49 @@ class MetricsDict(TypedDict):
     total_gold: int
     total_true_positives: int
     diagnostics: DiagnosticsDict
+
+
+def map_schema_errors_to_validation_errors(
+    schema_errors: list[str],
+) -> list[tuple[ValidationErrorType, str, list[str]]]:
+    """Map llm_schema_lite.validate() error strings into ValidationError tuples.
+
+    Attempts to classify enum violations for alignment[].source / alignment[].target
+    as INVALID_SOURCE_TOKEN / INVALID_TARGET_TOKEN, respectively. All other errors
+    are categorized as OTHER.
+
+    Args:
+        schema_errors: List of error messages from llm_schema_lite.validate()
+
+    Returns:
+        List of (ValidationErrorType, message, token_list) tuples
+
+    Example:
+        >>> errs = [
+        ...   "Validation error at '.alignment[0].source': 'foo' is not in the allowed set",
+        ...   "Validation error at '.alignment': too short (min length is 3)",
+        ... ]
+        >>> out = map_schema_errors_to_validation_errors(errs)
+        >>> out[0][0] == ValidationErrorType.INVALID_SOURCE_TOKEN
+        True
+        >>> out[1][0] == ValidationErrorType.OTHER
+        True
+    """
+    src_pat = re.compile(r"\.alignment(?:\[\d+\])?\.source\b")
+    tgt_pat = re.compile(r"\.alignment(?:\[\d+\])?\.target\b")
+    tok_pat = re.compile(r"'([^']+)'")  # first quoted token, if present
+
+    mapped: list[tuple[ValidationErrorType, str, list[str]]] = []
+    for msg in schema_errors:
+        token_match = tok_pat.search(msg)
+        tok_list = [token_match.group(1)] if token_match else []
+        if src_pat.search(msg):
+            mapped.append((ValidationErrorType.INVALID_SOURCE_TOKEN, msg, tok_list))
+        elif tgt_pat.search(msg):
+            mapped.append((ValidationErrorType.INVALID_TARGET_TOKEN, msg, tok_list))
+        else:
+            mapped.append((ValidationErrorType.OTHER, msg, tok_list))
+    return mapped
 
 
 def categorize_validation_errors(
@@ -377,6 +422,8 @@ def _process_alignment_sync(
     unaligned_target: set[str] = set()
     remaining_source: set[str] = set(source_mapping.uniquified)
     remaining_target: set[str] = set(target_mapping.uniquified)
+    last_reasoning: Optional[str] = None
+    schema_feedback_given = False
 
     for attempt in range(max_retries):
         logger.debug(f"Attempt {attempt + 1} for alignment")
@@ -397,6 +444,8 @@ def _process_alignment_sync(
             raw_response = llm_adapter(current_messages)
             raw_response = ensure_text_alignment(raw_response)
             current_attempt.raw_response = raw_response
+            if raw_response.reasoning:
+                last_reasoning = raw_response.reasoning
             logger.debug(f"Raw response: {raw_response}")
 
             (
@@ -472,6 +521,7 @@ def _process_alignment_sync(
                     alignment=valid_alignments,
                     source_mapping=source_mapping,
                     target_mapping=target_mapping,
+                    reasoning=last_reasoning,
                 )
                 attempts.append(current_attempt)
                 break
@@ -494,6 +544,58 @@ def _process_alignment_sync(
                 )
             )
 
+        except SchemaValidationError as e:
+            # Record categorized errors on this attempt
+            current_attempt.exception = (
+                f"SchemaValidationError: {len(e.errors)} error(s)"
+            )
+            current_attempt.validation_passed = False
+            current_attempt.validation_errors = map_schema_errors_to_validation_errors(
+                e.errors
+            )
+            logger.warning(
+                f"Attempt {attempt + 1} schema validation failed with {len(e.errors)} error(s)"
+            )
+
+            # Provide actionable feedback to the model
+            messages.append(
+                UserMessage(
+                    "Your previous JSON did not pass schema validation.\n"
+                    "Please fix the following errors and only emit a single JSON object:\n"
+                    + "\n".join(f"- {err}" for err in e.errors)
+                )
+            )
+
+            # Optional enhancement: include simplified schema once if requested
+            if llm_adapter.include_schema and not schema_feedback_given:
+                DynamicSchema = create_dynamic_alignment_schema(
+                    source_tokens,
+                    target_tokens,
+                    marker_generator,
+                    use_reasoning=llm_adapter.use_reasoning,
+                )
+                schema_str = simplify_schema(
+                    DynamicSchema, include_metadata=True
+                ).to_string()
+                messages.append(UserMessage("Expected schema:\n" + schema_str))
+                schema_feedback_given = True
+
+            # Also guide alignment completion with remaining tokens context
+            messages.append(
+                _create_retry_message(
+                    valid_alignments,
+                    remaining_source,
+                    remaining_target,
+                    source_tokens,
+                    target_tokens,
+                    marker_generator,
+                )
+            )
+
+            attempts.append(current_attempt)
+            # Proceed to next attempt
+            continue
+
         except Exception as e:
             current_attempt.exception = str(e)
             logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
@@ -511,6 +613,7 @@ def _process_alignment_sync(
             alignment=valid_alignments,
             source_mapping=source_mapping,
             target_mapping=target_mapping,
+            reasoning=last_reasoning,
         )
 
     return AlignmentResult(
@@ -582,22 +685,28 @@ def _create_alignment_messages(
 
     if include_schema:
         DynamicSchema = create_dynamic_alignment_schema(
-            source_tokens, target_tokens, marker_generator
+            source_tokens,
+            target_tokens,
+            marker_generator,
+            use_reasoning=use_reasoning,
         )
         simplified = simplify_schema(DynamicSchema, include_metadata=True)
         schema_str = simplified.to_string()
         system_msg_parts.append(f"\nExpected schema:\n```text\n{schema_str}\n```")
 
-    system_msg_parts.extend(
-        [
-            "Constraints:",
-            "1) Use only tokens from the enumerated sets; do not invent or normalize tokens.",
-            '2) Emit exactly one JSON object with top-level key "alignment"; no extra text or markdown.',
-            "3) Articles and determiners (e.g., 'the', 'a', 'an') are often <unaligned>; output <unaligned> rather than forcing an incorrect pair.",
-            "4) Align punctuation only if both sides contain the corresponding punctuation; otherwise use <unaligned>.",
-            "5) Never align <unaligned> with <unaligned>.",
-        ]
-    )
+    constraints_lines = [
+        "Constraints:",
+        "1) Use only tokens from the enumerated sets; do not invent or normalize tokens.",
+        (
+            "2) Emit exactly one JSON object with top-level keys 'alignment' and 'reasoning'; no extra text or markdown."
+            if use_reasoning
+            else '2) Emit exactly one JSON object with top-level key "alignment"; no extra text or markdown.'
+        ),
+        "3) Articles and determiners (e.g., 'the', 'a', 'an') are often <unaligned>; output <unaligned> rather than forcing an incorrect pair.",
+        "4) Align punctuation only if both sides contain the corresponding punctuation; otherwise use <unaligned>.",
+        "5) Never align <unaligned> with <unaligned>.",
+    ]
+    system_msg_parts.extend(constraints_lines)
 
     if guidelines:
         system_msg_parts.append(
@@ -1089,6 +1198,8 @@ async def align_tokens_async(
     unaligned_target: set[str] = set()
     remaining_source: set[str] = set(source_mapping.uniquified)
     remaining_target: set[str] = set(target_mapping.uniquified)
+    last_reasoning: Optional[str] = None
+    schema_feedback_given = False
 
     for attempt in range(max_retries):
         current_messages = format_messages(messages)
@@ -1107,6 +1218,8 @@ async def align_tokens_async(
             raw = await llm_adapter.acall(current_messages)
             ta = ensure_text_alignment(raw)
             current_attempt.raw_response = ta
+            if ta.reasoning:
+                last_reasoning = ta.reasoning
 
             (
                 _,
@@ -1174,6 +1287,7 @@ async def align_tokens_async(
                     alignment=valid_alignments,
                     source_mapping=source_mapping,
                     target_mapping=target_mapping,
+                    reasoning=last_reasoning,
                 )
                 attempts.append(current_attempt)
                 break
@@ -1191,6 +1305,53 @@ async def align_tokens_async(
                 )
             )
 
+        except SchemaValidationError as e:
+            current_attempt.exception = (
+                f"SchemaValidationError: {len(e.errors)} error(s)"
+            )
+            current_attempt.validation_passed = False
+            current_attempt.validation_errors = map_schema_errors_to_validation_errors(
+                e.errors
+            )
+            logger.warning(
+                f"Attempt {attempt + 1} schema validation failed with {len(e.errors)} error(s)"
+            )
+
+            messages.append(
+                UserMessage(
+                    "Your previous JSON did not pass schema validation.\n"
+                    "Please fix the following errors and only emit a single JSON object:\n"
+                    + "\n".join(f"- {err}" for err in e.errors)
+                )
+            )
+
+            if llm_adapter.include_schema and not schema_feedback_given:
+                DynamicSchema = create_dynamic_alignment_schema(
+                    source_tokens,
+                    target_tokens,
+                    marker_generator,
+                    use_reasoning=llm_adapter.use_reasoning,
+                )
+                schema_str = simplify_schema(
+                    DynamicSchema, include_metadata=True
+                ).to_string()
+                messages.append(UserMessage("Expected schema:\n" + schema_str))
+                schema_feedback_given = True
+
+            messages.append(
+                _create_retry_message(
+                    valid_alignments,
+                    remaining_source,
+                    remaining_target,
+                    source_tokens,
+                    target_tokens,
+                    marker_generator,
+                )
+            )
+
+            attempts.append(current_attempt)
+            continue
+
         except Exception as e:
             current_attempt.exception = str(e)
             logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
@@ -1203,6 +1364,7 @@ async def align_tokens_async(
             alignment=valid_alignments,
             source_mapping=source_mapping,
             target_mapping=target_mapping,
+            reasoning=last_reasoning,
         )
 
     # Sort final alignment by position
@@ -1285,6 +1447,7 @@ def align_tokens_batched(
     existing_valid_alignments: list[list[TokenAlignment]] = [
         [] for _ in source_sequences
     ]
+    last_reasonings: list[Optional[str]] = [None] * len(source_sequences)
     retry_indices = list(range(len(source_sequences)))
 
     # Create progress bar to track completed sequences
@@ -1360,6 +1523,8 @@ def align_tokens_batched(
                 # Normalize and validate
                 try:
                     ta = ensure_text_alignment(result)
+                    if ta.reasoning:
+                        last_reasonings[seq_idx] = ta.reasoning
                 except Exception as e:
                     sequence_attempts[seq_idx].append(
                         AlignmentAttempt(
@@ -1447,6 +1612,7 @@ def align_tokens_batched(
                         alignment=valid_aligns_filtered,
                         source_mapping=source_mappings[seq_idx],
                         target_mapping=target_mappings[seq_idx],
+                        reasoning=last_reasonings[seq_idx],
                     ).sort_by_position(
                         source_mappings[seq_idx], target_mappings[seq_idx]
                     )
@@ -1486,6 +1652,7 @@ def align_tokens_batched(
                 alignment=existing_valid_alignments[i],
                 source_mapping=source_mappings[i],
                 target_mapping=target_mappings[i],
+                reasoning=last_reasonings[i],
             )
         sorted_result = (
             result.sort_by_position(source_mappings[i], target_mappings[i])
@@ -1983,6 +2150,7 @@ def align_tokens_raw(
                 alignment=valid_alignments,
                 source_mapping=source_mapping,
                 target_mapping=target_mapping,
+                reasoning=result.reasoning,
             )
             if valid_alignments
             else None
@@ -2068,6 +2236,7 @@ async def align_tokens_raw_async(
                 alignment=valid_alignments,
                 source_mapping=source_mapping,
                 target_mapping=target_mapping,
+                reasoning=result.reasoning,
             )
             if valid_alignments
             else None

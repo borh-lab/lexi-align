@@ -152,6 +152,24 @@ def make_unique(
         >>> from lexi_align.text_processing import create_underscore_generator
         >>> make_unique(["the", "cat", "the", "mat"], create_underscore_generator())
         ['the_1', 'cat', 'the_2', 'mat']
+        >>> # Multiple duplicates
+        >>> make_unique(["the", "the", "the", "cat"])
+        ['the₁', 'the₂', 'the₃', 'cat']
+        >>> # Already unique tokens unchanged
+        >>> make_unique(["the", "cat", "sat"])
+        ['the', 'cat', 'sat']
+        >>> # Existing markers are stripped and re-applied
+        >>> make_unique(["the₁", "the₂", "the₁"])
+        ['the₁', 'the₂', 'the₃']
+        >>> # Type errors
+        >>> make_unique("not a list")  # doctest: +ELLIPSIS
+        Traceback (most recent call last):
+            ...
+        TypeError: Input must be a list
+        >>> make_unique([1, 2, 3])  # doctest: +ELLIPSIS
+        Traceback (most recent call last):
+            ...
+        TypeError: All tokens must be strings
     """
     if not isinstance(tokens, list):
         raise TypeError("Input must be a list")
@@ -263,17 +281,97 @@ class TokenMapping:
             for token in self.uniquified
         }
 
+    def get_position_uniquified(self, token: str) -> int:
+        """Get position of a uniquified token via exact lookup.
+
+        Performs no normalization; returns -1 if token not found.
+
+        Args:
+            token: Uniquified token (e.g., 'the₁', 'cat')
+
+        Returns:
+            Position index or -1 if not found
+
+        Example:
+            >>> mapping = create_token_mapping(['the', 'cat', 'the'])
+            >>> mapping.get_position_uniquified('the₁')
+            0
+            >>> mapping.get_position_uniquified('cat')
+            1
+            >>> mapping.get_position_uniquified('the₂')
+            2
+            >>> mapping.get_position_uniquified('nonexistent')
+            -1
+        """
+        return self.unique_positions.get(token, -1)
+
+    def get_position_normalized(self, token: str) -> int:
+        """Get position of a token via normalization (strip markers).
+
+        Normalizes the token by removing markers, then returns the first
+        occurrence position from the original token list; returns -1 if not found.
+
+        Args:
+            token: Token possibly containing markers (e.g., 'the₁', 'the')
+
+        Returns:
+            Position index of first occurrence or -1 if not found
+
+        Example:
+            >>> mapping = create_token_mapping(['the', 'cat', 'the'])
+            >>> mapping.get_position_normalized('the₁')
+            0
+            >>> mapping.get_position_normalized('the')
+            0
+            >>> mapping.get_position_normalized('cat')
+            1
+            >>> mapping.get_position_normalized('the₂')
+            0
+            >>> mapping.get_position_normalized('nonexistent')
+            -1
+        """
+        base = remove_unique_one(token, self.marker_pattern)
+        pos_list = self.positions.get(base)
+        return pos_list[0] if pos_list else -1
+
     def get_position(self, token: str, normalized: bool = True) -> int:
-        """Get position of a token, optionally normalizing it first."""
+        """Get position of a token, optionally normalizing it first.
+
+        Args:
+            token: Token to look up (may be uniquified or normalized)
+            normalized: If False, perform exact uniquified lookup only.
+                       If True (default), try exact uniquified lookup first,
+                       then fall back to normalized lookup.
+
+        Returns:
+            Position index or -1 if not found
+
+        Example:
+            >>> mapping = create_token_mapping(['the', 'cat', 'the'])
+            >>> # Exact uniquified lookup (normalized=False)
+            >>> mapping.get_position('the₁', normalized=False)
+            0
+            >>> mapping.get_position('cat', normalized=False)
+            1
+            >>> mapping.get_position('the', normalized=False)
+            -1
+            >>> # Normalized lookup (normalized=True, default)
+            >>> mapping.get_position('the', normalized=True)
+            0
+            >>> mapping.get_position('the₁', normalized=True)
+            0
+            >>> mapping.get_position('the₂', normalized=True)
+            2
+            >>> mapping.get_position('nonexistent', normalized=True)
+            -1
+        """
         if not normalized:
-            return self.unique_positions.get(token, -1)
+            return self.get_position_uniquified(token)
         # If it's already a uniquified token, look it up directly
         if token in self.unique_positions:
             return self.unique_positions[token]
         # Otherwise normalize and return the first occurrence position (if any)
-        base = remove_unique_one(token, self.marker_pattern)
-        pos_list = self.positions.get(base)
-        return pos_list[0] if pos_list else -1
+        return self.get_position_normalized(token)
 
     def get_uniquified(self, token: str) -> str:
         """Get uniquified version of a normalized token."""
@@ -443,7 +541,10 @@ class TextAlignment(TextAlignmentSchema):
         # Handle dynamic schema if adapter supports it
         if adapter and adapter.supports_length_constraints():
             dynamic_schema = create_dynamic_alignment_schema(
-                source_tokens, target_tokens, marker_generator
+                source_tokens,
+                target_tokens,
+                marker_generator,
+                use_reasoning=adapter.use_reasoning if adapter else False,
             )
             schema = dynamic_schema.model_validate(schema_data, context=context)
             # Convert back to base schema
@@ -489,6 +590,7 @@ class TextAlignment(TextAlignmentSchema):
             alignment=sorted_regular + special,
             source_mapping=source_mapping,
             target_mapping=target_mapping,
+            reasoning=self.reasoning,
         )
 
     def __eq__(self, other: object) -> bool:
@@ -650,9 +752,9 @@ def create_dynamic_alignment_schema(
             # Override parent's optional field with required field
             reasoning: str = Field(
                 ...,  # Ellipsis makes it required (no default)
-                min_length=50,
-                max_length=2000,
-                description="Provide detailed step-by-step reasoning about alignment decisions, considering: semantic equivalence, syntactic roles, idiomatic expressions, and structural differences between languages. Explain why each alignment choice was made. Minimum 50 characters required.",
+                # min_length=50,
+                # max_length=2000,
+                description="Provide detailed step-by-step reasoning about alignment decisions, considering: semantic equivalence, syntactic roles, idiomatic expressions, and structural differences between languages. Explain briefly why each alignment choice was made.",
             )
 
             if TYPE_CHECKING:
